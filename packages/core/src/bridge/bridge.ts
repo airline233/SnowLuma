@@ -7,16 +7,16 @@ import type { ForwardNodePayload, QQEventVariant, MessageElement } from './event
 import type { FriendInfo, QQGroupInfo, GroupMemberInfo, UserProfileInfo, GroupRequestInfo } from './qq-info';
 import { MSG_PUSH_CMD, parseMsgPush } from './msg-push';
 import type { PacketSender, SendPacketResult } from '../protocol/packet-sender';
-import { protoEncode, protoDecode } from '../protobuf/decode';
+import { protobuf_encode, protobuf_decode } from '@snowluma/proton';
 import { buildSendElems } from './element-builder';
 import { IdentityService } from './identity-service';
 import type { BridgeInterface } from './bridge-interface';
 import { IncomingPacketPipeline, type CmdParser } from './packet-pipeline';
 import { createLogger } from '../utils/logger';
-import {
-  SendMessageRequestSchema,
-  SendMessageResponseSchema,
-} from './proto/action';
+import type {
+  SendMessageRequest,
+  SendMessageResponse,
+} from './proto/proton/action';
 
 // Delegated modules
 import {
@@ -126,7 +126,14 @@ import {
   getCookiesStr as getCookiesStr_,
   getCsrfToken as getCsrfToken_,
   getCredentials as getCredentials_,
+  getGroupAlbumListWeb as getGroupAlbumListWeb_,
+  uploadImageToGroupAlbumWeb as uploadImageToGroupAlbumWeb_,
 } from './web-actions';
+import { getGroupAlbumMediaList as getGroupAlbumMediaList_,
+  commentGroupAlbumMedia as commentGroupAlbumMedia_,
+  likeGroupAlbumMedia as likeGroupAlbumMedia_,
+  deleteGroupAlbumMedia as deleteGroupAlbumMedia_,
+} from './actions/group-album';
 import type { GroupFilesResult } from './actions/group-file';
 import type { MediaIndexNode } from './actions/shared';
 import { BridgeEventBus } from './event-bus';
@@ -275,13 +282,13 @@ export class Bridge implements BridgeInterface {
     const protoElems = await buildSendElems(elements, { bridge: this, groupId });
     const random = this.nextMessageRandom();
 
-    const request = protoEncode({
+    const request = protobuf_encode<SendMessageRequest>({
       routingHead: {
         grp: { groupCode: BigInt(groupId) },
-      } as any,
+      },
       contentHead: {
         type: 1,
-      } as any,
+      },
       messageBody: {
         richText: {
           elems: protoElems,
@@ -293,7 +300,7 @@ export class Bridge implements BridgeInterface {
       via: 0,
       dataStatist: 0,
       multiSendSeq: 0,
-    }, SendMessageRequestSchema);
+    });
 
     const result = await this.sendRawPacket(Bridge.SEND_MSG_CMD, request);
 
@@ -301,7 +308,7 @@ export class Bridge implements BridgeInterface {
       throw new Error(`send group message failed: ${result.errorMessage || 'no response'}`);
     }
 
-    const response = protoDecode(result.responseData, SendMessageResponseSchema);
+    const response = protobuf_decode<SendMessageResponse>(result.responseData);
     if (!response) {
       throw new Error('failed to decode SendMessageResponse');
     }
@@ -336,18 +343,18 @@ export class Bridge implements BridgeInterface {
     const random = this.nextMessageRandom();
     const clientSeq = this.nextClientSequence();
 
-    const request = protoEncode({
+    const request = protobuf_encode<SendMessageRequest>({
       routingHead: {
         c2c: {
           uin: userUin,
           ...(userUid ? { uid: userUid } : {}),
         },
-      } as any,
+      },
       contentHead: {
         type: 1,
         subType: 0,
         c2cCmd: 11,
-      } as any,
+      },
       messageBody: {
         richText: {
           elems: protoElems,
@@ -360,9 +367,9 @@ export class Bridge implements BridgeInterface {
       dataStatist: 0,
       ctrl: {
         msgFlag: Math.floor(Date.now() / 1000),
-      } as any,
+      },
       multiSendSeq: 0,
-    }, SendMessageRequestSchema);
+    });
 
     const result = await this.sendRawPacket(Bridge.SEND_MSG_CMD, request);
 
@@ -370,7 +377,7 @@ export class Bridge implements BridgeInterface {
       throw new Error(`send private message failed: ${result.errorMessage || 'no response'}`);
     }
 
-    const response = protoDecode(result.responseData, SendMessageResponseSchema);
+    const response = protobuf_decode<SendMessageResponse>(result.responseData);
     if (!response) {
       throw new Error('failed to decode SendMessageResponse');
     }
@@ -389,6 +396,76 @@ export class Bridge implements BridgeInterface {
       random,
       timestamp,
     };
+  }
+
+  /**
+   * Send a c2c file as a chat message.
+   *
+   * Unlike images / videos / records that ride on `RichText.elems` as
+   * regular Elem entries, c2c files use `RichText.notOnlineFile`
+   * (parallel to `elems`, see `proto/proton/message.ts:75`). The
+   * receive-side decoder strips this back to a `{type:'file'}` segment
+   * in `rich-body-decoder.ts:425-433`. There's no Elem you can stuff
+   * into `buildSendElems` for this, so this helper short-circuits the
+   * normal send pipeline.
+   */
+  async sendC2cFileMessage(
+    userUin: number,
+    userUid: string,
+    info: { fileId: string; fileName: string; fileSize: number; fileMd5: Uint8Array; fileHash?: string },
+  ): Promise<SendMessageReceipt> {
+    const random = this.nextMessageRandom();
+    const clientSeq = this.nextClientSequence();
+
+    const request = protobuf_encode<SendMessageRequest>({
+      routingHead: {
+        c2c: { uin: userUin, uid: userUid },
+      },
+      contentHead: {
+        type: 1,
+        subType: 0,
+        c2cCmd: 11,
+      },
+      messageBody: {
+        richText: {
+          notOnlineFile: {
+            fileType: 0,
+            fileUuid: info.fileId,
+            fileMd5: info.fileMd5,
+            fileName: info.fileName,
+            fileSize: BigInt(info.fileSize),
+            fileHash: info.fileHash ?? '',
+          },
+        },
+      } as any,
+      clientSequence: clientSeq,
+      random,
+      syncCookie: new Uint8Array(0),
+      via: 0,
+      dataStatist: 0,
+      ctrl: {
+        msgFlag: Math.floor(Date.now() / 1000),
+      },
+      multiSendSeq: 0,
+    });
+
+    const result = await this.sendRawPacket(Bridge.SEND_MSG_CMD, request);
+    if (!result.success || !result.gotResponse || !result.responseData) {
+      throw new Error(`send c2c file message failed: ${result.errorMessage || 'no response'}`);
+    }
+
+    const response = protobuf_decode<SendMessageResponse>(result.responseData);
+    if (!response) {
+      throw new Error('failed to decode SendMessageResponse');
+    }
+    if (response.result !== undefined && response.result !== 0) {
+      throw new Error(`send c2c file message rejected: result=${response.result} err=${response.errMsg ?? ''}`);
+    }
+
+    const seq = response.privateSequence ?? 0;
+    const messageId = (random & 0x7FFFFFFF) || seq;
+    const timestamp = response.timestamp1 ?? Math.floor(Date.now() / 1000);
+    return { messageId, sequence: seq, clientSequence: clientSeq, random, timestamp };
   }
 
   // --- Delegated: OIDB helpers ---
@@ -482,6 +559,30 @@ export class Bridge implements BridgeInterface {
 
   async getGroupEssenceAll(groupId: number): Promise<any> {
     return getGroupEssenceAll_(this, groupId);
+  }
+
+  async getGroupAlbumList(groupId: number): Promise<any> {
+    return getGroupAlbumListWeb_(this, groupId);
+  }
+
+  async uploadImageToGroupAlbum(groupId: number, albumId: string, albumName: string, filePath: string): Promise<void> {
+    return uploadImageToGroupAlbumWeb_(this, groupId, albumId, albumName, filePath);
+  }
+
+  async getGroupAlbumMediaList(groupId: number, albumId: string, attachInfo?: string): Promise<any> {
+    return getGroupAlbumMediaList_(this, groupId, albumId, attachInfo);
+  }
+
+  async commentGroupAlbumMedia(groupId: number, albumId: string, lloc: string, content: string): Promise<any> {
+    return commentGroupAlbumMedia_(this, groupId, albumId, lloc, content);
+  }
+
+  async likeGroupAlbumMedia(groupId: number, albumId: string, batchId: string, lloc: string | undefined, isLike: boolean): Promise<any> {
+    return likeGroupAlbumMedia_(this, groupId, albumId, batchId, lloc, isLike);
+  }
+
+  async deleteGroupAlbumMedia(groupId: number, albumId: string, lloc: string): Promise<any> {
+    return deleteGroupAlbumMedia_(this, groupId, albumId, lloc);
   }
 
   async sendGroupNotice(groupId: number, content: string, options?: any) {
