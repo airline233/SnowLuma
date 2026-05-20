@@ -136,19 +136,80 @@ export async function sendPrivateMessage(
   });
   if (elements.length === 0) throw new Error('message is empty');
 
-  const receipt = await ref.bridge.sendPrivateMessage(userId, elements);
-  const messageId = hashMessageIdInt32(receipt.sequence, userId, PRIVATE_MESSAGE_EVENT);
+  // C2C `{type:'file'}` segments can't ride on the elems[] pipeline —
+  // c2c files live on `RichText.notOnlineFile`, parallel to elems
+  // (see `proto/proton/message.ts:notOnlineFile`). The element-builder
+  // explicitly drops them with a warn ("file send via elems[] is
+  // group-only"), so a private message that bundled a file alongside
+  // anything else used to either ship as "[空消息]" (only-file case,
+  // 0 elements after drop) or silently lose the file (mixed case).
+  //
+  // NapCat splits the same way (`dev/NapCatQQ/.../SendMsg.ts:404-415`):
+  // FILE / VIDEO / ARK / PTT each go in their own sendMsg call,
+  // never mixed with the regular elements. We only need it for file
+  // here — video/ARK/ptt already go through commonElem so the
+  // element-builder handles them inline.
+  const fileElements = elements.filter(e => e.type === 'file' && e.fileId);
+  const nonFileElements = elements.filter(e => e.type !== 'file');
+  if (fileElements.length !== elements.filter(e => e.type === 'file').length) {
+    log.warn('[OneBot] private file segment without file_id — skipped (upload first via upload_private_file)');
+  }
 
-  logSentMessage(false, userId, elements);
+  let lastReceipt: Awaited<ReturnType<typeof ref.bridge.sendPrivateMessage>> | undefined;
+  if (nonFileElements.length > 0) {
+    lastReceipt = await ref.bridge.sendPrivateMessage(userId, nonFileElements);
+    logSentMessage(false, userId, nonFileElements);
+  }
+  if (fileElements.length > 0) {
+    // C2C file send needs the recipient's UID — resolve once and reuse.
+    const userUid = await ref.bridge.resolveUserUid(userId);
+    if (!userUid) {
+      throw new Error(`c2c file send: could not resolve uid for user ${userId}`);
+    }
+    for (const fileEl of fileElements) {
+      // C2C file send requires fileSize/fileMd5/fileName to ride on the
+      // wire (NotOnlineFile inside msgContent). The OneBot caller
+      // usually only echoes the file_id from a previous
+      // `upload_private_file`, so look up the rest from the upload
+      // cache. Inline segment fields (md5/size/name) take precedence so
+      // a caller that already knows everything can bypass the cache.
+      const cached = ref.bridge.recallUploadedFile(fileEl.fileId!);
+      const fileMd5 = fileEl.md5Hex
+        ? Buffer.from(fileEl.md5Hex, 'hex')
+        : (cached?.fileMd5 ?? new Uint8Array(0));
+      const fileSize = fileEl.fileSize ?? cached?.fileSize ?? 0;
+      // Fall back to a generic name — the QQ server resolves the
+      // file by fileUuid, not name, so a missing name only affects
+      // the chat bubble display.
+      const fileName = fileEl.fileName ?? cached?.fileName ?? 'file';
+      const fileHash = fileEl.fileHash ?? cached?.fileHash;
+      if (fileSize === 0 && !cached) {
+        log.warn(
+          '[OneBot] c2c file_id=%s sent without fileSize and no upload cache — recipient may see 0 B',
+          fileEl.fileId,
+        );
+      }
+      lastReceipt = await ref.bridge.sendC2cFileMessage(userId, userUid, {
+        fileId: fileEl.fileId!,
+        fileName,
+        fileSize,
+        fileMd5,
+        fileHash,
+      });
+      logSentMessage(false, userId, [fileEl]);
+    }
+  }
+  if (!lastReceipt) throw new Error('message is empty');
 
+  const messageId = hashMessageIdInt32(lastReceipt.sequence, userId, PRIVATE_MESSAGE_EVENT);
   ref.cacheMessageMeta(messageId, {
     isGroup: false,
     targetId: userId,
-    sequence: receipt.sequence,
+    sequence: lastReceipt.sequence,
     eventName: PRIVATE_MESSAGE_EVENT,
-    clientSequence: receipt.clientSequence,
-    random: receipt.random,
-    timestamp: receipt.timestamp,
+    clientSequence: lastReceipt.clientSequence,
+    random: lastReceipt.random,
+    timestamp: lastReceipt.timestamp,
   });
 
   return { messageId };
@@ -184,19 +245,60 @@ export async function sendGroupMessage(
   });
   if (elements.length === 0) throw new Error('message is empty');
 
-  const receipt = await ref.bridge.sendGroupMessage(groupId, elements);
-  const messageId = hashMessageIdInt32(receipt.sequence, groupId, GROUP_MESSAGE_EVENT);
+  // Group `{type:'file', file_id}` segments don't ride on the elems[]
+  // pipeline either. The QQ-NT server rejects PbSendMsg with a
+  // transElem(24) file payload (result=79); the correct send path is a
+  // dedicated OIDB call (`OidbSvcTrpcTcp.0x6d9_4`) that publishes a
+  // previously-uploaded file id as a chat bubble. Mirrors the c2c-file
+  // split below (private path) — both must be peeled off before the
+  // regular sendGroupMessage runs.
+  const fileElements = elements.filter(e => e.type === 'file' && e.fileId);
+  const nonFileElements = elements.filter(e => e.type !== 'file');
+  if (fileElements.length !== elements.filter(e => e.type === 'file').length) {
+    log.warn('[OneBot] group file segment without file_id — skipped (upload first via upload_group_file)');
+  }
 
-  logSentMessage(true, groupId, elements);
+  let lastReceipt: Awaited<ReturnType<typeof ref.bridge.sendGroupMessage>> | undefined;
+  if (nonFileElements.length > 0) {
+    lastReceipt = await ref.bridge.sendGroupMessage(groupId, nonFileElements);
+    logSentMessage(true, groupId, nonFileElements);
+  }
+  for (const fileEl of fileElements) {
+    // Group-file publish has no per-message sequence/random tuple to
+    // hash a messageId from — OIDB 0x6d9_4 is fire-and-forget on the
+    // wire. If this is the LAST element we still need a receipt so
+    // the OneBot caller can cache the id; synthesise one from the
+    // file_id hash + a fresh timestamp.
+    await ref.bridge.sendGroupFileMessage(groupId, fileEl.fileId!);
+    logSentMessage(true, groupId, [fileEl]);
+    if (!lastReceipt) {
+      // Use a hash of the fileId as a stable pseudo-id; this gets
+      // mixed with groupId in `hashMessageIdInt32` below.
+      let h = 0;
+      const s = fileEl.fileId ?? '';
+      for (let i = 0; i < s.length; i++) {
+        h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+      }
+      lastReceipt = {
+        messageId: 0,
+        sequence: h & 0x7FFFFFFF,
+        clientSequence: 0,
+        random: h & 0x7FFFFFFF,
+        timestamp: Math.floor(Date.now() / 1000),
+      };
+    }
+  }
+  if (!lastReceipt) throw new Error('message is empty');
 
+  const messageId = hashMessageIdInt32(lastReceipt.sequence, groupId, GROUP_MESSAGE_EVENT);
   ref.cacheMessageMeta(messageId, {
     isGroup: true,
     targetId: groupId,
-    sequence: receipt.sequence,
+    sequence: lastReceipt.sequence,
     eventName: GROUP_MESSAGE_EVENT,
-    clientSequence: receipt.clientSequence,
-    random: receipt.random,
-    timestamp: receipt.timestamp,
+    clientSequence: lastReceipt.clientSequence,
+    random: lastReceipt.random,
+    timestamp: lastReceipt.timestamp,
   });
 
   return { messageId };
@@ -530,6 +632,13 @@ function logSentMessage(isGroup: boolean, targetId: number, elements: MessageEle
       case 'poke':
         parts.push('[戳一戳]');
         break;
+      case 'file':
+        // Avoid the misleading "[空消息]" the user previously saw when
+        // sending a file segment — the message is NOT empty, it's a
+        // file post. Show the name (or id as fallback) so the log
+        // reflects what actually went out.
+        parts.push(`[文件:${elem.fileName || elem.fileId || ''}]`);
+        break;
       default:
         break;
     }
@@ -635,34 +744,42 @@ async function parseForwardNodes(
     const content = (nodeData.content ?? nodeData.message ?? '') as JsonValue;
 
     let elements: MessageElement[];
+    let innerForward: ForwardNodePayload[] | undefined;
     if (isNestedNodeArray(content)) {
       // Nested forward chain — `content` is itself a list of `{type:'node'}`
-      // segments. Recursively parse them into ForwardNodePayloads, upload
-      // that inner chain as its own forward, then embed an ARK preview
-      // card pointing at the inner res_id. The receiving QQ client renders
-      // it as a tap-to-expand nested forward bubble. Matches NapCat's
-      // `SendMsg.uploadForwardedNodesPacket` recursion contract.
+      // segments. We recursively parse them into a sibling
+      // `ForwardNodePayload[]` and attach it to this node as `innerForward`.
+      // `uploadForwardNodes` then drives the recursive upload + ARK-preview
+      // generation + msgBody piggyback in one pass over the whole tree.
       //
-      // Without this, the inner `{type:'node'}` entries fell through to
-      // `parseMessage` which produced useless `MessageElement{type:'node'}`
-      // entries that `element-builder` silently drops — leaving the outer
-      // forward with an empty body that QQ refuses with "message is empty"
-      // (single-node case) or a node whose content is missing the inner
-      // forward (mixed case).
-      const innerNodes = await parseForwardNodes(ref, content, {
+      // Why hand it off instead of uploading here: NapCat (`dev/NapCatQQ/
+      // .../SendMsg.uploadForwardedNodesPacket`) carries every inner level's
+      // packetMsg up to the outermost long-msg upload as extra
+      // `actionCommand` slots, so the receiver gets the whole tree from one
+      // server fetch. That cross-layer piggyback needs the upload pipeline
+      // to own the recursion — doing it in `parseForwardNodes` would force
+      // each level to do its own independent long-msg upload, which is what
+      // the previous implementation did and what a NapCat-compatible
+      // receiver couldn't walk.
+      innerForward = await parseForwardNodes(ref, content, {
         groupId: options.groupId,
         userId: options.userId,
         depth: depth + 1,
       });
-      const innerResId = await ref.bridge.uploadForwardNodes(innerNodes, options.groupId, options.userId);
-      const isGroup = options.groupId !== undefined;
-      elements = [buildForwardPreviewElement(innerResId, innerNodes, isGroup, undefined)];
+      // Placeholder — `uploadForwardNodes` replaces these with a real
+      // forward-preview MessageElement once it has the inner res_id +
+      // uuid in hand.
+      elements = [];
     } else {
       elements = await parseMessage(content, false);
     }
-    if (elements.length === 0) throw new Error(`forward node content is empty: ${userUin}`);
+    if (!innerForward && elements.length === 0) {
+      throw new Error(`forward node content is empty: ${userUin}`);
+    }
 
-    nodes.push({ userUin, nickname, elements });
+    const node: ForwardNodePayload = { userUin, nickname, elements };
+    if (innerForward) node.innerForward = innerForward;
+    nodes.push(node);
   }
 
   if (nodes.length === 0) {

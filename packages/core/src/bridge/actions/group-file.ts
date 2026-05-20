@@ -19,6 +19,7 @@ import type {
   OidbGroupFileResp,
   OidbGroupFileViewReq,
   OidbGroupFileViewResp,
+  OidbGroupSendFileReq,
   OidbPrivateFileDownloadReq,
   OidbPrivateFileDownloadResp,
   OidbPrivateFileUploadReq,
@@ -81,6 +82,19 @@ function normalizeDirectory(dir?: string): string {
 function bytesToHexUpper(data: unknown): string {
   if (!(data instanceof Uint8Array) || data.length === 0) return '';
   return toHexUpper(data);
+}
+
+// Reverses acidify's `Int.toIpString()`: the 32-bit IP arrives
+// little-endian-packed (byte0 = first dotted octet) and we unpack it the
+// same way. Force-unsigned the shift to keep negative ints (high bit set)
+// rendering correctly — JS `>>` is arithmetic and would turn 0xFF000000
+// into a negative number.
+function int32ToIpv4Dotted(value: number): string {
+  const b1 = value & 0xFF;
+  const b2 = (value >>> 8) & 0xFF;
+  const b3 = (value >>> 16) & 0xFF;
+  const b4 = (value >>> 24) & 0xFF;
+  return `${b1}.${b2}.${b3}.${b4}`;
 }
 
 function normalizeUploadFileName(name: string, fallback: string): string {
@@ -260,6 +274,48 @@ async function fetchNtv2DownloadUrl(
   return `https://${domain}${path}${rKeyParam}`;
 }
 
+// ─────────────── publish (group file → chat) ───────────────
+
+/**
+ * Publish a previously-uploaded group file as a chat message.
+ *
+ * Wire is OIDB `OidbSvcTrpcTcp.0x6d9_4` — NOT `MessageSvc.PbSendMsg`.
+ * Lagrange.Core V2 splits these two roles: the file UPLOAD path goes
+ * via 0x6D6_0 + highway PUT, then a SECOND OIDB hop (this one) tells
+ * the QQ server "now publish that staged blob as a chat message" so
+ * everyone in the group can see the file bubble.
+ *
+ * The old approach — wrap the file as `TransElem(elemType=24)` inside
+ * `richText.elems[]` and ship it via PbSendMsg — works for INCOMING
+ * messages (the receive decoder unpacks transElem(24) into a
+ * FileEntity) but the QQ-NT server REJECTS it on outgoing with
+ * `result=79` ("invalid element on send-side"). Mirror Lagrange's
+ * dedicated GroupSendFileService instead.
+ *
+ * The unused `field4` slot and the `field3=random` value match
+ * Lagrange's send-side defaults (`OidbSvcTrpcTcp0x6D9_4.cs` + the
+ * `Random.Shared.Next()` call in `GroupSendFileService.cs`). Field 5
+ * is the `Field5=true` flag the receiver's deserializer expects.
+ */
+export async function sendGroupFileMessage(bridge: Bridge, groupId: number, fileId: string): Promise<void> {
+  if (!fileId) throw new Error('sendGroupFileMessage requires fileId');
+  const env = makeOidbEnvelope<OidbGroupSendFileReq>(0x6D9, 4, {
+    body: {
+      groupUin: groupId,
+      type: 2,
+      info: {
+        busiType: 102,
+        fileId,
+        field3: Math.floor(Math.random() * 0x7fffffff) >>> 0,
+        field5: true,
+      },
+    },
+  });
+  // The envelope-level errorCode peek inside `runOidb` covers the
+  // happy-path validation; failures surface as a thrown OIDB error.
+  await runOidb(bridge, 'OidbSvcTrpcTcp.0x6d9_4', encodeOidbEnv<OidbGroupSendFileReq>(env));
+}
+
 // ─────────────── file count ───────────────
 
 export async function fetchGroupFileCount(bridge: Bridge, groupId: number): Promise<{ fileCount: number; maxCount: number }> {
@@ -323,6 +379,23 @@ export async function uploadGroupFile(
   const fileId = typeof upload.fileId === 'string' && upload.fileId ? upload.fileId : null;
   if (!fileId) throw new Error('group file upload response missing file_id');
 
+  // Remember the upload so a later `send_group_msg` carrying just the
+  // file_id can route via `sendGroupFileMessage` without forcing the
+  // OneBot caller to thread fileName/size/md5 separately. For groups
+  // the wire publish (OIDB 0x6d9_4) only needs the file_id itself, so
+  // this is mainly for log-line correctness; the c2c counterpart in
+  // `uploadPrivateFile` is where the cache is actually load-bearing.
+  bridge.rememberUploadedFile({
+    fileId,
+    scope: 'group',
+    groupId,
+    fileName,
+    fileSize: loaded.bytes.length,
+    fileMd5: hashes.md5,
+    fileSha1: hashes.sha1,
+    rememberedAt: Date.now(),
+  });
+
   if (!upload.boolFileExist && uploadFile) {
     const senderUin = toInt(bridge.identity.uin);
     if (senderUin <= 0) throw new Error('invalid self uin for group file upload');
@@ -353,22 +426,20 @@ export async function uploadGroupFile(
   }
 
   // Stage 3: file is on the server, now publish it as a chat message.
+  //
   // Without this, OIDB 0x6D6_0 + highway PUT only stages the bytes —
-  // the chat shows nothing. NapCat does the same (upload + sendMsg
-  // atomically inside `upload_group_file`, see
-  // `dev/napcatQQ/.../UploadGroupFile.ts:54-58`). Only suppressed when
-  // the caller opts out via `uploadFile=false` (treat that as "I only
-  // wanted the slot allocated, hold the chat post").
+  // the chat shows nothing. The publish step goes via a dedicated OIDB
+  // call (0x6D9_4), NOT via `MessageSvc.PbSendMsg` with a transElem(24)
+  // payload — the QQ-NT server rejects that with `result=79`. Mirrors
+  // Lagrange.Core V2's `GroupSendFileService.cs`. Suppressed when the
+  // caller opts out via `uploadFile=false` (treat that as "I only
+  // wanted the slot allocated, hold the chat post"). Routes through
+  // the public bridge method (rather than the local `sendGroupFileMessage`)
+  // so tests can mock at the bridge boundary, matching the pattern
+  // `uploadPrivateFile` uses with `bridge.sendC2cFileMessage`.
   if (uploadFile) {
     try {
-      await bridge.sendGroupMessage(groupId, [{
-        type: 'file',
-        fileId,
-        fileName,
-        fileSize: loaded.bytes.length,
-        md5Hex: bytesToHexUpper(hashes.md5),
-        sha1Hex: bytesToHexUpper(hashes.sha1),
-      }]);
+      await bridge.sendGroupFileMessage(groupId, fileId);
     } catch (err) {
       // The bytes are already on the server and the fileId is valid —
       // fail loud but don't lose the upload result the action handler
@@ -439,11 +510,88 @@ export async function uploadPrivateFile(
   const fileHash = typeof upload.fileAddon === 'string' && upload.fileAddon ? upload.fileAddon : null;
   if (!fileId) throw new Error('private file upload response missing file_id');
 
+  // Cache the metadata so a later `send_private_msg` carrying just
+  // `{type:'file', file_id}` can resurrect the full c2c-file packet
+  // (NotOnlineFile { fileSize, fileMd5, fileName, fileHash }). Without
+  // this the recipient sees a 0-byte file because the OneBot send path
+  // has no way to recover those fields from the file_id alone.
+  bridge.rememberUploadedFile({
+    fileId,
+    scope: 'private',
+    userId,
+    fileName,
+    fileSize: loaded.bytes.length,
+    fileMd5: hashes.md5,
+    fileSha1: hashes.sha1,
+    fileHash: fileHash ?? '',
+    rememberedAt: Date.now(),
+  });
+
   if (!upload.boolFileExist && uploadFile) {
-    const uploadHost = (typeof upload.uploadIp === 'string' && upload.uploadIp)
+    // Host selection.
+    //
+    // Current QQ-NT server rollout has stopped populating the legacy
+    // `uploadIp` (field 60) entirely. The host now arrives as the first
+    // entry of `rtpMediaPlatformUploadAddress` (field 210, repeated
+    // IPv4 message) — same place acidify reads it from since their
+    // 2026-04 protobuf refactor. Each IPv4 has paired `inIP`/`inPort`
+    // (LAN, same DC as the OIDB endpoint) and `outIP`/`outPort` (WAN);
+    // acidify uses `inIP`/`inPort` exclusively and so do we, because
+    // that's the address the highway PUT actually needs to reach.
+    //
+    // The 32-bit IPs are little-endian-packed (byte0 = first octet)
+    // per acidify's `Int.toIpString()`. Cross-checked the byte order
+    // by inspecting their highway flow — there's no separate htonl
+    // step, so the integer is already in network-octet-first order.
+    //
+    // Older server versions still populate the legacy string fields
+    // (uploadIp / uploadDomain / uploadIpList[0] / uploadHttpsDomain /
+    // uploadDns), so we fall through to those after rtpMediaPlatform.
+    // Pair an HTTPS-flavored host with `uploadHttpsPort` if that's
+    // what we picked.
+    const rtpFirst = (Array.isArray(upload.rtpMediaPlatformUploadAddress)
+      && upload.rtpMediaPlatformUploadAddress[0])
+      ? upload.rtpMediaPlatformUploadAddress[0] : null;
+    const rtpInIP = rtpFirst && typeof rtpFirst.inIP === 'number' && rtpFirst.inIP !== 0
+      ? int32ToIpv4Dotted(rtpFirst.inIP) : '';
+    const rtpInPort = rtpFirst && typeof rtpFirst.inPort === 'number'
+      ? rtpFirst.inPort : 0;
+    const ipListFirst = (Array.isArray(upload.uploadIpList) && upload.uploadIpList[0])
+      ? upload.uploadIpList[0] : '';
+    const uploadHost = (rtpInIP)
+      || (typeof upload.uploadIp === 'string' && upload.uploadIp)
+      || (typeof upload.uploadDomain === 'string' && upload.uploadDomain)
+      || (ipListFirst)
+      || (typeof upload.uploadHttpsDomain === 'string' && upload.uploadHttpsDomain)
+      || (typeof upload.uploadDns === 'string' && upload.uploadDns)
       || '';
-    const uploadPort = toInt(upload.uploadPort);
+    const httpsHostUsed = !rtpInIP && !upload.uploadIp && !upload.uploadDomain && !ipListFirst
+      && typeof upload.uploadHttpsDomain === 'string' && !!upload.uploadHttpsDomain;
+    const uploadPort = rtpInIP && rtpInPort > 0
+      ? rtpInPort
+      : httpsHostUsed && toInt(upload.uploadHttpsPort) > 0
+        ? toInt(upload.uploadHttpsPort)
+        : toInt(upload.uploadPort);
     if (!uploadHost || uploadPort <= 0) {
+      // Surface every host-bearing field we know about so a user
+      // hitting this can show us exactly which slot the server filled
+      // (or whether it returned nothing at all — which would point at
+      // a request mismatch rather than a missing decoder).
+      const rtpDump = Array.isArray(upload.rtpMediaPlatformUploadAddress)
+        ? JSON.stringify(upload.rtpMediaPlatformUploadAddress.map((e) => ({
+          outIP: e.outIP, outPort: e.outPort, inIP: e.inIP, inPort: e.inPort,
+          iPType: e.iPType,
+        })))
+        : '[]';
+      log.warn(
+        'private file upload host missing — rtp=%s ip=%s domain=%s ipList=%s httpsDomain=%s dns=%s lanip=%s port=%s httpsPort=%s',
+        rtpDump,
+        upload.uploadIp ?? '', upload.uploadDomain ?? '',
+        JSON.stringify(upload.uploadIpList ?? []),
+        upload.uploadHttpsDomain ?? '', upload.uploadDns ?? '',
+        upload.uploadLanip ?? '', upload.uploadPort ?? 0,
+        upload.uploadHttpsPort ?? 0,
+      );
       throw new Error('private file upload host is invalid');
     }
 

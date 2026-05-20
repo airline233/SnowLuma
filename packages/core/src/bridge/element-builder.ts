@@ -13,11 +13,12 @@ import type {
   MentionExtraSend,
   MarkdownData,
 } from './proto/proton/action';
-import type { GroupFileExtra } from './proto/proton/element';
+// `GroupFileExtra` + `hexToBytes` used to support `makeGroupFileElem`
+// (removed — see comment above the former call site). The receive-side
+// decoder in `msg-push/rich-body-decoder.ts` still pulls those in.
 import { uploadImageMsgInfo } from './highway/image-upload';
 import { uploadPttMsgInfo } from './highway/ptt-upload';
 import { uploadVideoMsgInfo } from './highway/video-upload';
-import { hexToBytes } from './highway/pipeline';
 
 type ProtoElem = Partial<ProtoDecoded<typeof ElemSchema>>;
 
@@ -246,54 +247,12 @@ async function makePttElem(ctx: SendContext, element: MessageElement): Promise<P
   };
 }
 
-function makeGroupFileElem(element: MessageElement): ProtoElem {
-  // Group file chat element. The OIDB 0x6D6_0 upload + highway PUT only
-  // stages the bytes on QQ's side; without this trailing message the
-  // file is uploaded but never appears in the chat — that's the
-  // "log says uploaded but message is empty" bug the user reported.
-  //
-  // Wire shape: `Elem.transElem` (field 5) with `elemType=24` and an
-  // `elemValue` of `0x01 | BE16(len) | GroupFileExtra(protobuf)`. The
-  // 0x01 prefix and BE16 length wrapper match what the receive-side
-  // decoder in `msg-push/rich-body-decoder.ts:171-185` already strips.
-  if (!element.fileId) throw new Error('file element missing fileId');
-  const fileSize = element.fileSize ?? 0;
-  const fileName = element.fileName ?? '';
-  const md5 = element.md5Hex ? hexToBytes(element.md5Hex) : new Uint8Array(0);
-  const sha1 = element.sha1Hex ? hexToBytes(element.sha1Hex) : new Uint8Array(0);
-
-  const extraBytes = protobuf_encode<GroupFileExtra>({
-    inner: {
-      info: {
-        busId: 102,
-        fileId: element.fileId,
-        fileSize: BigInt(fileSize),
-        fileName,
-        fileSha: sha1,
-        extInfoString: '',
-        fileMd5: md5,
-      },
-    },
-  });
-  if (extraBytes.length > 0xFFFF) {
-    // The 16-bit length prefix caps the payload at 64 KiB; even the
-    // densest GroupFileExtra (fileId/name/two hashes) is well under.
-    // This is here so a future schema change can't silently truncate.
-    throw new Error(`group file extra too large (${extraBytes.length} > 65535)`);
-  }
-  const elemValue = new Uint8Array(3 + extraBytes.length);
-  elemValue[0] = 0x01;
-  elemValue[1] = (extraBytes.length >> 8) & 0xff;
-  elemValue[2] = extraBytes.length & 0xff;
-  elemValue.set(extraBytes, 3);
-
-  return {
-    transElem: {
-      elemType: 24,
-      elemValue,
-    } as any,
-  };
-}
+// (formerly `makeGroupFileElem` — removed. The `transElem(24)` shape it
+// produced was a RECEIVE-side encoding only. The QQ-NT server rejects
+// outgoing PbSendMsg with that element with `result=79`; group files
+// publish through `OidbSvcTrpcTcp.0x6d9_4` instead, called from the
+// OneBot layer at `modules/message-actions.ts::sendGroupMessage` after
+// the file segment is split off.)
 
 async function makeVideoElem(ctx: SendContext, element: MessageElement): Promise<ProtoElem> {
   const isGroup = ctx.groupId !== undefined;
@@ -383,15 +342,22 @@ export async function buildSendElems(elements: MessageElement[], ctx?: SendConte
         break;
 
       case 'file':
-        // The group `TransElem(24)` shape works for group chats only.
-        // C2C files live on `RichText.notOnlineFile` instead of in the
-        // elems array, so `sendPrivateMessage` short-circuits before it
-        // ever lands here — see `bridge.sendPrivateMessage`.
-        if (ctx?.groupId !== undefined) {
-          result.push(makeGroupFileElem(elem));
-        } else {
-          console.warn('[ElemBuilder] file send via elems[] is group-only; use bridge.sendC2cFileMessage for c2c');
-        }
+        // Files NEVER ride on the elems[] pipeline anymore — both flavors
+        // route at the OneBot layer:
+        //   * c2c (private): split off and dispatched via
+        //     `bridge.sendC2cFileMessage` (uses routingHead.trans0x211 +
+        //     msgContent FileExtra; see bridge.ts::sendC2cFileMessage).
+        //   * group: split off and dispatched via
+        //     `bridge.sendGroupFileMessage` (uses OIDB 0x6d9_4; see
+        //     actions/group-file.ts::sendGroupFileMessage).
+        //
+        // The old transElem(24) shape DOES work for receive-side decode
+        // (rich-body-decoder unpacks it into a FileEntity), but the
+        // QQ-NT server rejects it on outgoing with result=79. If a file
+        // segment still reaches us here the caller forgot to route at
+        // the OneBot layer — drop with a loud warn so it doesn't silently
+        // ship as "[空消息]" or a 0-byte stub.
+        console.warn('[ElemBuilder] BUG: {type:"file"} reached element-builder — must be split out at the OneBot layer (see modules/message-actions.ts::sendPrivateMessage / ::sendGroupMessage)');
         break;
 
       default:

@@ -548,6 +548,41 @@ export interface OidbGroupFileResp {
   move?:     pb<6, OidbGroupFileRetResp>;
 }
 
+// --- 0x6D9_4: Group file PUBLISH-AS-CHAT-MESSAGE ---
+//
+// Posts an already-uploaded group file (via 0x6D6_0 + highway) as a
+// chat message in the group. This is a separate OIDB endpoint from
+// the file upload — NOT a `MessageSvc.PbSendMsg` with a `TransElem`
+// payload (sending the file as a transElem(24) is a RECEIVE-side
+// decoding shape, and the QQ-NT server rejects it on send with
+// `result=79`).
+//
+// Wire shape (mirrors Lagrange.Core V2's nesting):
+//   OidbBase.body (envelope field 4)
+//     → OidbGroupSendFileReq.body (field 5) ← the nested wrapper
+//         → OidbGroupSendFileBody { groupUin, type, info }
+//
+// Ports `dev/Lagrange.Core/.../Internal/Service/Message/GroupSendFileService.cs`
+// + `Internal/Packets/Service/Oidb/Request/OidbSvcTrpcTcp0x6D9_4.cs`.
+
+export interface OidbGroupSendFileInfo {
+  busiType?: pb<1, uint_32>;  // hardcoded 102
+  fileId?:   pb<2, string>;   // uuid from 0x6D6_0 upload response
+  field3?:   pb<3, uint_32>;  // random uint32 (msg id seed)
+  field4?:   pb<4, string>;   // null/empty on send
+  field5?:   pb<5, bool>;     // hardcoded true
+}
+
+export interface OidbGroupSendFileBody {
+  groupUin?: pb<1, uint_32>;
+  type?:     pb<2, uint_32>;  // hardcoded 2 (= chat post)
+  info?:     pb<3, OidbGroupSendFileInfo>;
+}
+
+export interface OidbGroupSendFileReq {
+  body?: pb<5, OidbGroupSendFileBody>;
+}
+
 // --- 0x6D7_0 / 0x6D7_1 / 0x6D7_2: Group file folder ops ---
 
 export interface OidbGroupFileCreateFolderReq {
@@ -643,15 +678,58 @@ export interface OidbPrivateFileUploadReq {
   flagSupportMediaPlatform?: pb<200, int_32>;
 }
 
+// IPv4 wire message used inside ApplyUploadRespV3.rtpMediaPlatformUploadAddress
+// (field 210). Sourced from acidify's `IPv4` class — outIP/inIP are
+// little-endian-packed 32-bit IPv4 addresses (byte order: low byte = first
+// octet), decoded via the standard `(ip & 0xFF).(ip>>8 & 0xFF)....` recipe.
+// outPort/inPort are the matching port for each leg (out = WAN, in = LAN).
+// iPType is the address family hint (1 = IPv4, etc — acidify treats it
+// purely as metadata, no behavior).
+export interface IPv4 {
+  outIP?:   pb<1, int_32>;
+  outPort?: pb<2, int_32>;
+  inIP?:    pb<3, int_32>;
+  inPort?:  pb<4, int_32>;
+  iPType?:  pb<5, int_32>;
+}
+
 export interface OidbPrivateFileUploadRespBody {
   retCode?:                pb<10, int_32>;
   retMsg?:                 pb<20, string>;
+  // 30/40/50 (totalSpace/usedSpace/uploadedSize int64) intentionally
+  // omitted — proton only needs fields we actually consume, and the
+  // quota numbers don't drive any code path.
   uploadIp?:               pb<60, string>;
+  // Cross-checked against LagrangeGo `OidbSvcTrpcTcp0xE37_800.proto`
+  // (fields 60-170 enumerated below) + NapCat `Oidb.0XE37_800.ts` +
+  // acidify (most recent NT-protocol fork, 2026-04). Real server in
+  // 2026 has been observed to leave the legacy host fields empty and
+  // put the host into the new field 210 (`rtpMediaPlatformUploadAddress`,
+  // repeated IPv4 messages) instead — the consumer walks them in that
+  // order. Decoding the legacy fields too means we keep working against
+  // older server rollouts.
+  uploadDomain?:           pb<70, string>;
   uploadPort?:             pb<80, uint_32>;
   uuid?:                   pb<90, string>;
   uploadKey?:              pb<100, bytes>;
   boolFileExist?:          pb<110, bool>;
+  uploadIpList?:           pb_repeated<130, string>;
+  uploadHttpsPort?:        pb<140, int_32>;
+  uploadHttpsDomain?:      pb<150, string>;
+  uploadDns?:              pb<160, string>;
+  uploadLanip?:            pb<170, string>;
+  // Field 200 — acidify renamed this to `fileIdCrc` in their 2026-04
+  // refactor; we keep `fileAddon` because the wire bytes are identical
+  // and our callers already read `fileAddon` as the file-hash blob (it's
+  // a hex string in practice). Worth renaming if a consumer ever needs
+  // the new semantic.
   fileAddon?:              pb<200, string>;
+  // Field 210 — the new "host carrier" the NT server actually populates
+  // in current rollouts. Each IPv4 entry has `inIP`/`inPort` (LAN) +
+  // `outIP`/`outPort` (WAN). acidify reads `inIP`+`inPort` exclusively;
+  // we follow suit because that's what the highway HTTP PUT needs to
+  // reach (same datacenter as the OIDB endpoint that returned this).
+  rtpMediaPlatformUploadAddress?: pb_repeated<210, IPv4>;
   mediaPlatformUploadKey?: pb<220, bytes>;
 }
 
