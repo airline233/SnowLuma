@@ -17,7 +17,7 @@ import { register as registerRequest } from './actions/request';
 import { register as registerExtended } from './actions/extended';
 import { register as registerGroupAlbum } from './actions/group-album';
 
-import { WebHonorType } from '@snowluma/bridge/web/group-honor';
+import { WebHonorType } from '@snowluma/protocol/web/group-honor';
 import type { ClientKeyInfo } from '@snowluma/core/bridge';
 
 export interface MessageSendResult {
@@ -96,6 +96,26 @@ export interface ApiActionContext {
   forwardSingleMsg: (messageId: number, target: { groupId?: number; userId?: number }) => Promise<{ messageId: number }>;
   // setMsgEmojiLike: stays because it threads messageStore meta lookup.
   setMsgEmojiLike: (messageId: number, emojiId: string, set: boolean) => Promise<void>;
+  /**
+   * Fetch the cached reactor user list for a (message, emoji) pair.
+   * Backed by ReactionStore — see `reaction-store.ts` for the
+   * limitations vs. NapCat's wrapper-cache approach.
+   *
+   * `serverCount` comes from a side `0x9084_1` summary call; when it
+   * exceeds `cachedUsers.length` the cache is provably incomplete
+   * (push events missed before bot boot, etc).
+   */
+  fetchEmojiLikeUsers: (
+    messageId: number,
+    emojiId: string,
+    count: number,
+    offset?: number,
+  ) => Promise<{
+    users: Array<{ uin: number; uid: string; setAt: number }>;
+    cachedCount: number;
+    serverCount: number;
+    complete: boolean;
+  }>;
   // All other extended / NapCat-compatible / Web / Album actions are
   // accessed directly through `ctx.bridge.apis.<area>.<method>()`:
   //   * profile area:    setProfile / setOnlineStatus / fetchCustomFace /
