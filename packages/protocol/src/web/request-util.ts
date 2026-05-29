@@ -1,5 +1,7 @@
-import https from 'node:https';
 import http from 'node:http';
+import https from 'node:https';
+
+type RequestBody = string | Buffer | Uint8Array | Record<string, unknown> | undefined;
 
 export class RequestUtil {
   static async HttpsGetCookies(url: string): Promise<{ [key: string]: string; }> {
@@ -50,9 +52,9 @@ export class RequestUtil {
     });
   }
 
-  static async HttpGetJson<T>(url: string, method: string = 'GET', data?: any, headers: {
-        [key: string]: string;
-    } = {}, isJsonRet: boolean = true, isArgJson: boolean = true, maxRedirects: number = 5): Promise<T> {
+  static async HttpGetJson<T>(url: string, method: string = 'GET', data?: RequestBody, headers: {
+    [key: string]: string;
+  } = {}, isJsonRet: boolean = true, isArgJson: boolean = true, maxRedirects: number = 5): Promise<T> {
     const option = new URL(url);
     const protocol = url.startsWith('https://') ? https : http;
     const options = {
@@ -91,8 +93,8 @@ export class RequestUtil {
             } else {
               reject(new Error(`Unexpected status code: ${res.statusCode}`));
             }
-          } catch (parseError: any) {
-            reject(new Error(parseError.message));
+          } catch (parseError: unknown) {
+            reject(new Error(parseError instanceof Error ? parseError.message : String(parseError)));
           }
         });
       });
@@ -105,7 +107,7 @@ export class RequestUtil {
     });
   }
 
-  static async HttpGetText(url: string, method: string = 'GET', data?: any, headers: { [key: string]: string; } = {}) {
+  static async HttpGetText(url: string, method: string = 'GET', data?: RequestBody, headers: { [key: string]: string; } = {}) {
     return this.HttpGetJson<string>(url, method, data, headers, false, false);
   }
 }

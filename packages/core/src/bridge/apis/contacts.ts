@@ -1,12 +1,10 @@
-// ContactsApi — facade over the 6 contacts-related OIDB cmds (friend
-// roster / group roster / member roster / user profile / group request
-// list / download rkeys). Single-shot cmds forward straight to their
-// namespace; pagination and the per-group cache + inflight coalescing
-// for fetchGroupMemberList live here because they need cross-call
-// state.
-
-import type { BridgeContext } from '../bridge-context';
-import type { DownloadRKeyInfo } from '../bridge';
+import { FetchDownloadRkeys } from '@snowluma/protocol/oidb-services/contacts/fetch-download-rkeys';
+import { FetchFriendListPage } from '@snowluma/protocol/oidb-services/contacts/fetch-friend-list-page';
+import { FetchGroupList } from '@snowluma/protocol/oidb-services/contacts/fetch-group-list';
+import { FetchGroupMemberListPage } from '@snowluma/protocol/oidb-services/contacts/fetch-group-member-list-page';
+import { FetchGroupRequests } from '@snowluma/protocol/oidb-services/contacts/fetch-group-requests';
+import { FetchUserProfile } from '@snowluma/protocol/oidb-services/contacts/fetch-user-profile';
+import { FetchUserProfileByUid } from '@snowluma/protocol/oidb-services/contacts/fetch-user-profile-by-uid';
 import type {
   FriendInfo,
   GroupMemberInfo,
@@ -14,17 +12,24 @@ import type {
   QQGroupInfo,
   UserProfileInfo,
 } from '@snowluma/protocol/qq-info';
-import { FetchFriendListPage } from '@snowluma/protocol/oidb-services/contacts/fetch-friend-list-page';
-import { FetchGroupList } from '@snowluma/protocol/oidb-services/contacts/fetch-group-list';
-import { FetchGroupMemberListPage } from '@snowluma/protocol/oidb-services/contacts/fetch-group-member-list-page';
-import { FetchUserProfile } from '@snowluma/protocol/oidb-services/contacts/fetch-user-profile';
-import { FetchUserProfileByUid } from '@snowluma/protocol/oidb-services/contacts/fetch-user-profile-by-uid';
-import { FetchGroupRequests } from '@snowluma/protocol/oidb-services/contacts/fetch-group-requests';
-import { FetchDownloadRkeys } from '@snowluma/protocol/oidb-services/contacts/fetch-download-rkeys';
+import type { DownloadRKeyInfo } from '../bridge';
+import type { BridgeContext } from '../bridge-context';
 
 // ─── Helpers (previously in bridge-contacts.ts) ───────────────────
 
-export function buildFriendProperties(raw: any): Map<number, string> {
+type FriendPropertySource = {
+  additional?: Array<{
+    type?: number;
+    layer1?: {
+      properties?: Array<{
+        code?: number;
+        value?: string;
+      }>;
+    };
+  }>;
+};
+
+export function buildFriendProperties(raw: FriendPropertySource): Map<number, string> {
   const props = new Map<number, string>();
   for (const additional of raw.additional ?? []) {
     if ((additional.type ?? 0) !== 1 || !additional.layer1) continue;
@@ -58,7 +63,7 @@ export class ContactsApi {
   private memberListInflight = new Map<number, Promise<GroupMemberInfo[]>>();
   private memberListLastFetch = new Map<number, { at: number; data: GroupMemberInfo[] }>();
 
-  constructor(private readonly ctx: BridgeContext) {}
+  constructor(private readonly ctx: BridgeContext) { }
 
   async fetchFriendList(): Promise<FriendInfo[]> {
     const friends: FriendInfo[] = [];

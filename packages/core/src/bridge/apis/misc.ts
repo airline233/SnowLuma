@@ -1,27 +1,23 @@
-// MiscApi — odds & ends that don't fit the other Apis: translation,
-// mini-app ARK build, inline-keyboard button click, group sign-in.
-// Inlined from `actions/misc.ts` (deleted alongside actions/* in
-// commit 13).
-
-import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
+import type { JsonObject, JsonValue } from '@snowluma/common/json';
 import type {
   MiniAppShareReq,
   MiniAppShareResp,
 } from '@snowluma/proto-defs/oidb-actions/base';
+import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import type { BridgeContext } from '../bridge-context';
 // Migrated OIDB cmds — facade methods are one-line forwarders.
-import { TranslateEnToZh } from '@snowluma/protocol/oidb-services/misc/translate-en-to-zh';
 import { ClickInlineKeyboardButton } from '@snowluma/protocol/oidb-services/misc/click-inline-keyboard-button';
 import { SendGroupSign } from '@snowluma/protocol/oidb-services/misc/send-group-sign';
+import { TranslateEnToZh } from '@snowluma/protocol/oidb-services/misc/translate-en-to-zh';
 
 export class MiscApi {
-  constructor(private readonly ctx: BridgeContext) {}
+  constructor(private readonly ctx: BridgeContext) { }
 
   translateEn2Zh(words: string[]): Promise<string[]> {
     return TranslateEnToZh.invoke(this.ctx, { words });
   }
 
-  async getMiniAppArk(type: string, title: string, desc: string, picUrl: string, jumpUrl: string): Promise<any> {
+  async getMiniAppArk(type: string, title: string, desc: string, picUrl: string, jumpUrl: string): Promise<JsonObject> {
     let appid = '1109937557'; // default: bilibili
     let iconUrl = 'http://miniapp.gtimg.cn/public/appicon/51f90239b78a2e4994c11215f4c4ba15_200.jpg';
 
@@ -50,7 +46,7 @@ export class MiscApi {
       throw new Error('mini app share json empty');
     }
 
-    const parsed = JSON.parse(jsonStr);
+    const parsed = JSON.parse(jsonStr) as Record<string, JsonObject | string | number | boolean | null>;
 
     return {
       data: {
@@ -72,7 +68,7 @@ export class MiscApi {
     buttonId: string,
     callbackData: string,
     msgSeq: number,
-  ): Promise<any> {
+  ): Promise<JsonValue> {
     return ClickInlineKeyboardButton.invoke(this.ctx, { groupId, botAppid, buttonId, callbackData, msgSeq });
   }
 

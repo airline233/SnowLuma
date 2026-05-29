@@ -3,22 +3,25 @@
 // Self lookup needs the bot's own UID, hence the `identity` dependency.
 // For other users we use `resolveUserUid` to translate the uin first.
 
-import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import type { OidbBase } from '@snowluma/proto-defs/oidb';
 import type { Oidb0x7edReq, Oidb0x7edResp } from '@snowluma/proto-defs/oidb-actions/base';
-import { invokeOidb, type OidbSender } from '../../oidb-service';
+import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import type { BridgeContext } from '../../bridge-context';
+import { invokeOidb, type OidbSender } from '../../oidb-service';
 
 export interface LikeInfo {
+  [key: string]: import('@snowluma/common/json').JsonValue;
   uid: string;
   time: number;
   favoriteInfo: {
+    [key: string]: import('@snowluma/common/json').JsonValue;
     total_count: number;
     last_time: number;
     today_count: number;
     userInfos: never[];
   };
   voteInfo: {
+    [key: string]: import('@snowluma/common/json').JsonValue;
     total_count: number;
     new_count: number;
     new_nearby_count: number;

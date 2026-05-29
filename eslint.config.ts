@@ -1,9 +1,9 @@
 import js from '@eslint/js';
-import globals from 'globals';
 import reactHooks from 'eslint-plugin-react-hooks';
 import reactRefresh from 'eslint-plugin-react-refresh';
-import tseslint from 'typescript-eslint';
 import { defineConfig, globalIgnores } from 'eslint/config';
+import globals from 'globals';
+import tseslint from 'typescript-eslint';
 
 const tsconfigRootDir = decodeURIComponent(new URL('.', import.meta.url).pathname).replace(/^\/(.:\/)/, '$1');
 
@@ -48,7 +48,7 @@ export default defineConfig([
     rules: {
       'indent': ['error', 2, { SwitchCase: 1 }],
       'prefer-const': 'off',
-      '@typescript-eslint/no-explicit-any': 'off',
+      '@typescript-eslint/no-explicit-any': 'error',
       '@typescript-eslint/no-empty-object-type': 'off',
       '@typescript-eslint/no-this-alias': 'off',
       '@typescript-eslint/no-unused-vars': [
@@ -59,6 +59,18 @@ export default defineConfig([
           caughtErrorsIgnorePattern: '^_',
         },
       ],
+    },
+  },
+  {
+    files: ['**/tests/**/*.{ts,tsx}', '**/*.test.{ts,tsx}'],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',
+    },
+  },
+  {
+    files: ['**/bench/**/*.{ts,tsx}', 'packages/proton/test/**/*.{ts,tsx}'],
+    rules: {
+      '@typescript-eslint/no-explicit-any': 'off',
     },
   },
   {

@@ -12,9 +12,9 @@
 // — the facade swallows the namespace-level exception and surfaces
 // `null` so callers get a clean retcode.
 
-import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import type { OidbBase } from '@snowluma/proto-defs/oidb';
 import type { OidbStrangerStatusReq, OidbStrangerStatusResp } from '@snowluma/proto-defs/oidb-actions/base';
+import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import { invokeOidb, type OidbSender } from '../../oidb-service';
 
 export interface StrangerStatus {
@@ -41,7 +41,7 @@ export namespace GetStrangerStatus {
   export const deserialize = (_ctx: Deps, body: OidbStrangerStatusResp): StrangerStatus | null => {
     const raw = body.data?.status?.value;
     if (raw === undefined || raw === null) return null;
-    const extBig = typeof raw === 'bigint' ? raw : BigInt(raw as any);
+    const extBig = typeof raw === 'bigint' ? raw : BigInt(raw);
     if (extBig <= 10n) {
       return { status: Number(extBig) * 10, ext_status: 0 };
     }
