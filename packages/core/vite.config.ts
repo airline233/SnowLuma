@@ -23,7 +23,13 @@ const toPosix = (p: string) => p.replace(/\\/g, '/');
 // `@snowluma/websocket` is bundled — it's an
 // in-tree TS workspace wrapper that routes its native `.node`
 // addon through `dist/native/`. Only Node builtins stay external.
-const external: string[] = [];
+//
+// `node:sqlite` is an experimental builtin that Node 22.x lines don't
+// list in `builtinModules`, so the `nodeModules` sweep below misses it.
+// Externalise it explicitly — otherwise Vite bundles it and swaps in a
+// browser shell, crashing the hook with `DatabaseSync is not a
+// constructor` (the bug PR #68 set out to fix).
+const external: string[] = ['node:sqlite', 'sqlite'];
 
 const nodeModules = [...builtinModules, ...builtinModules.map((m) => `node:${m}`)].flat();
 
