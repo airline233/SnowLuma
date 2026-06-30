@@ -8,7 +8,7 @@ import { buildSendElems } from '@snowluma/protocol/element-builder';
 import type { MentionExtraSend } from '@snowluma/proto-defs/action';
 import type { MarketFacePbReserve } from '@snowluma/proto-defs/element';
 import type { OidbBase } from '@snowluma/proto-defs/oidb';
-import type { NTV2UploadRichMediaResp } from '@snowluma/proto-defs/highway';
+import type { NTV2UploadRichMediaReq, NTV2UploadRichMediaResp } from '@snowluma/proto-defs/highway';
 
 describe('parseMessage', () => {
   describe('plain text', () => {
@@ -91,6 +91,56 @@ describe('parseMessage', () => {
       expect(result).toHaveLength(1);
       expect(result[0].type).toBe('image');
       expect(result[0].url).toBe('https://example.com/img.png');
+    });
+
+    it('prefers a real url when file is a QQ-internal id (issue #155)', async () => {
+      // Yunzai et al. echo a received image by resending the original
+      // `file=<md5>.ext` together with the download `url`. `file` is not a
+      // local path, so picking it would statSync → ENOENT on send.
+      const result = await parseMessage(
+        [{
+          type: 'image',
+          data: {
+            file: '35246A5B5C287F680C90839829FD7620.png',
+            url: 'https://multimedia.nt.qq.com.cn/download?fileid=abc&rkey=xyz',
+            sub_type: 1,
+            summary: '[动画表情]',
+          },
+        }] as any,
+        true,
+      );
+      expect(result[0].type).toBe('image');
+      expect(result[0].url).toBe('https://multimedia.nt.qq.com.cn/download?fileid=abc&rkey=xyz');
+    });
+
+    it('keeps file when it is itself loadable even if a url is also present', async () => {
+      // A path (has a separator) or inline bytes are the actual content and
+      // must win over any sibling url.
+      const viaPath = await parseMessage(
+        [{ type: 'image', data: { file: '/tmp/local.png', url: 'https://example.com/other.png' } }] as any,
+        false,
+      );
+      expect(viaPath[0].url).toBe('/tmp/local.png');
+
+      const viaBase64 = await parseMessage(
+        [{ type: 'image', data: { file: 'base64://AAAA', url: 'https://example.com/other.png' } }] as any,
+        false,
+      );
+      expect(viaBase64[0].url).toBe('base64://AAAA');
+    });
+
+    it('falls back a QQ-internal id record/video to the sibling url (issue #155)', async () => {
+      const rec = await parseMessage(
+        [{ type: 'record', data: { file: 'ABCD1234.amr', url: 'https://example.com/v.amr' } }] as any,
+        false,
+      );
+      expect(rec).toEqual([{ type: 'record', url: 'https://example.com/v.amr' }]);
+
+      const vid = await parseMessage(
+        [{ type: 'video', data: { file: 'EF567890.mp4', url: 'https://example.com/v.mp4' } }] as any,
+        false,
+      );
+      expect(vid).toEqual([{ type: 'video', url: 'https://example.com/v.mp4', thumbUrl: undefined }]);
     });
 
     it('parses record segment from data.file', async () => {
@@ -275,8 +325,14 @@ describe('parseMessage', () => {
           thumbUrl: 'base64://iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
         }], { bridge, groupId: 123456 });
 
+        // The video main file carries real bytes but the server fast-paths it
+        // (fileExist:true, no uKey). The send trusts that single fast-path
+        // response — the old forceFullOnFastPath retry was removed (proven
+        // ineffective, see #145), so exactly ONE OIDB request goes out.
         expect(bridge.sendRawPacket).toHaveBeenCalledTimes(1);
-        expect(bridge.sendRawPacket).toHaveBeenCalledWith('OidbSvcTrpcTcp.0x11ea_100', expect.any(Uint8Array));
+        expect(bridge.sendRawPacket).toHaveBeenNthCalledWith(1, 'OidbSvcTrpcTcp.0x11ea_100', expect.any(Uint8Array));
+        const firstReq = protobuf_decode<OidbBase<NTV2UploadRichMediaReq>>(bridge.sendRawPacket.mock.calls[0]![1] as Uint8Array);
+        expect(firstReq.body.upload.tryFastUploadCompleted).toBe(true);
         expect(protoElems).toHaveLength(1);
         expect(protoElems[0].commonElem?.serviceType).toBe(48);
         expect(protoElems[0].commonElem?.businessType).toBe(21);

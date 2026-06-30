@@ -7,6 +7,7 @@ import type { ConverterContext } from './event-converter';
 import { registerEventPipeline } from './event-pipeline';
 import { buildApiContext, type OneBotInstanceContext } from './instance-context';
 import { RKeyCache } from './instance-rkey';
+import type { GlobalSettings } from './global-config';
 import { MediaIndexer } from './media-indexer';
 import { MediaStore } from './media-store';
 import { MediaUrlResolver } from './media-url-resolver';
@@ -72,8 +73,18 @@ export class OneBotInstance {
   invokeAction(action: string, params: JsonObject): Promise<ApiResponse> {
     return this.apiHandler.handle(action, params);
   }
+  /** Drive an action through the streaming seam (debug tester, stream actions).
+   *  `rawRequest` is a `{action, params, echo?}` JSON string; `emit` receives
+   *  each frame as a JSON string. Non-stream actions emit a single frame. */
+  invokeStream(
+    rawRequest: string,
+    emit: (json: string) => void | Promise<void>,
+    isAlive?: () => boolean,
+  ): Promise<void> {
+    return this.apiHandler.processStreamRequest(rawRequest, emit, isAlive);
+  }
 
-  constructor(uin: string, bridge: BridgeInterface, config: OneBotConfig) {
+  constructor(uin: string, bridge: BridgeInterface, config: OneBotConfig, globalSettings: GlobalSettings) {
     this.uin = uin;
     this.bridge = bridge;
     const uinNum = Number.parseInt(uin, 10);
@@ -81,7 +92,7 @@ export class OneBotInstance {
       ? moduleLog.child({ uin: uinNum })
       : moduleLog;
 
-    this.rkeyCache = new RKeyCache();
+    this.rkeyCache = new RKeyCache(globalSettings.rkey);
     this.mediaStore = new MediaStore(path.join('data', this.uin, 'media.db'));
     this.messageStore = new MessageStore(path.join('data', this.uin, 'messages.json'));
     this.reactionStore = new ReactionStore(path.join('data', this.uin, 'reactions.db'));
@@ -107,7 +118,7 @@ export class OneBotInstance {
       reactionStore: this.reactionStore,
       converterCtx: this.converterCtx,
       config,
-      musicSignUrl: config.musicSignUrl,
+      musicSignUrl: globalSettings.musicSignUrl,
       cacheMessageMeta: (messageId, meta) => this.cacheMessageMeta(messageId, meta),
       dispatchEvent: (event) => this.dispatchEvent(event),
     };
@@ -132,6 +143,13 @@ export class OneBotInstance {
     void this.applyConfigDiff(config).catch((err) => {
       this.log.warn('applyConfigDiff failed: %s', err instanceof Error ? (err.stack ?? err.message) : String(err));
     });
+  }
+
+  /** Apply edited global (all-accounts) settings without a restart. Called by
+   *  the manager when config/snowluma.json is saved from the WebUI. */
+  applyGlobalSettings(globalSettings: GlobalSettings): void {
+    this.rkeyCache.setFallbackServers(globalSettings.rkey.fallbackServers);
+    this.ctx.musicSignUrl = globalSettings.musicSignUrl;
   }
 
   dispose(): void {
@@ -189,7 +207,7 @@ export class OneBotInstance {
     if (!cfg.enabled) return false;
     const postType = event.post_type;
     if (postType !== 'message' && postType !== 'message_sent') return false;
-    if (!matchesStatusCommand(event.message)) return false;
+    if (!matchesStatusCommand(event.message, cfg.trigger)) return false;
 
     const isGroup = event.message_type === 'group';
     const sessionId = isGroup ? toInt(event.group_id) : toInt(event.user_id);

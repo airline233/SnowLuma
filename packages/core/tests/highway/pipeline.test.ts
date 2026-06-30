@@ -283,6 +283,11 @@ describe('pipeline — runNtv2Upload', () => {
     }))).rejects.toThrow(/image fast-upload not available/);
   });
 
+  // (Removed the forceFullOnFastPath retry tests with the feature itself — real-
+  // machine testing + kernel RE proved the tryFastUploadCompleted:false retry
+  // never forces a fresh upload; expired-but-indexed video resources are a
+  // platform limitation. See #145.)
+
   it('silently skips a sub-file with empty bytes when no fastOnlyError is configured', async () => {
     // This mirrors the video-thumb path where bytes are always synthesised
     // (FALLBACK_THUMB) so we don't expect the check to fire even if the

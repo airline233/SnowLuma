@@ -14,7 +14,7 @@ import { protobuf_decode, protobuf_encode } from '@snowluma/proton';
 import { randomUUID } from 'crypto';
 import { gunzipSync, gzipSync } from 'zlib';
 import type { Bridge } from '../bridge';
-import type { BridgeContext } from '../bridge-context';
+import type { BridgeContext, UploadedFileMeta } from '../bridge-context';
 import { resolveSelfUid, toInt } from './shared';
 
 function asBridge(ctx: BridgeContext): Bridge { return ctx as unknown as Bridge; }
@@ -23,6 +23,17 @@ function asBridge(ctx: BridgeContext): Bridge { return ctx as unknown as Bridge;
 // of the process — that's enough because OneBot clients typically
 // resolve a forward immediately after receiving the parent message.
 const forwardResCache = new Map<string, ForwardNodePayload[]>();
+
+/** QQ's placeholder when it doesn't hand back a real sender name — treated as
+ *  "missing" so #174's enrichment resolves the real nickname. */
+const FORWARD_NAME_PLACEHOLDER = 'QQ用户';
+
+/** Bounds on the L4 (per-uin profile) fallback when enriching forward senders.
+ *  Profile lookups are un-cached single-point OIDB calls Tencent rate-limits
+ *  aggressively, so cap how many distinct uins one forward resolves and how
+ *  many run at once — the rest keep the placeholder. */
+const FORWARD_PROFILE_MAX = 20;
+const FORWARD_PROFILE_CONCURRENCY = 4;
 
 // Per-layer piggyback entry. Each level of a nested forward attaches
 // its own msgBody under a uuid `actionCommand`, so when the receiver
@@ -202,12 +213,147 @@ function previewFromElements(elements: MessageElement[]): string {
   return '';
 }
 
+function cloneNodeWithElements(node: ForwardNodePayload, elements: MessageElement[]): ForwardNodePayload {
+  return {
+    userUin: node.userUin,
+    nickname: node.nickname,
+    elements,
+    time: node.time,
+    msgId: node.msgId,
+    msgSeq: node.msgSeq,
+    groupId: node.groupId,
+    senderCard: node.senderCard,
+    messageType: node.messageType,
+    innerForward: node.innerForward,
+  };
+}
+
+function stripFileSource(element: MessageElement): MessageElement {
+  const next: MessageElement = { ...element };
+  delete next.url;
+  return next;
+}
+
+function isCachedFileUsableInTarget(
+  cached: UploadedFileMeta | undefined,
+  groupId?: number,
+  userId?: number,
+): boolean {
+  if (!cached) return true;
+  if (groupId !== undefined) {
+    return cached.scope === 'group' && cached.groupId === groupId;
+  }
+  if (userId !== undefined) {
+    return cached.scope === 'private' && cached.userId === userId;
+  }
+  return true;
+}
+
+function fileNameForUpload(element: MessageElement, cached?: UploadedFileMeta): string {
+  return (element.fileName ?? cached?.fileName ?? '').trim();
+}
+
 export class ForwardApi {
   constructor(private readonly ctx: BridgeContext) { }
 
   async upload(nodes: ForwardNodePayload[], groupId?: number, userId?: number): Promise<string> {
     const { resId } = await this.uploadRecursive(nodes, groupId, userId);
     return resId;
+  }
+
+  private async downloadSourceFromCachedFile(cached: UploadedFileMeta): Promise<string> {
+    if (cached.scope === 'group' && cached.groupId !== undefined) {
+      return this.ctx.apis.groupFile.getUrl(cached.groupId, cached.fileId);
+    }
+    if (cached.scope === 'private' && cached.userId !== undefined && cached.fileHash) {
+      return this.ctx.apis.groupFile.getPrivateUrl(cached.userId, cached.fileId, cached.fileHash);
+    }
+    throw new Error('forward file_id belongs to another scope; pass file/base64/url so SnowLuma can re-upload it');
+  }
+
+  private async uploadForwardFileSource(
+    source: string,
+    name: string,
+    groupId?: number,
+    userId?: number,
+  ): Promise<MessageElement> {
+    if (groupId !== undefined) {
+      const uploaded = await this.ctx.apis.groupFile.upload(groupId, source, name, '/', true, false);
+      if (!uploaded.fileId) throw new Error('forward group file upload returned no file_id');
+      const cached = this.ctx.recallUploadedFile(uploaded.fileId);
+      const element: MessageElement = {
+        type: 'file',
+        fileId: uploaded.fileId,
+      };
+      const fileName = cached?.fileName || name;
+      if (fileName) element.fileName = fileName;
+      if (cached?.fileSize !== undefined) element.fileSize = cached.fileSize;
+      return element;
+    }
+    if (userId !== undefined) {
+      const uploaded = await this.ctx.apis.groupFile.uploadPrivate(userId, source, name, true, false);
+      if (!uploaded.fileId) throw new Error('forward private file upload returned no file_id');
+      const cached = this.ctx.recallUploadedFile(uploaded.fileId);
+      const element: MessageElement = {
+        type: 'file',
+        fileId: uploaded.fileId,
+      };
+      const fileName = cached?.fileName || name;
+      const fileHash = uploaded.fileHash ?? cached?.fileHash ?? '';
+      if (fileName) element.fileName = fileName;
+      if (cached?.fileSize !== undefined) element.fileSize = cached.fileSize;
+      if (fileHash) element.fileHash = fileHash;
+      return element;
+    }
+    throw new Error('forward file source requires group_id or user_id');
+  }
+
+  private async prepareForwardFileElement(
+    element: MessageElement,
+    groupId?: number,
+    userId?: number,
+  ): Promise<MessageElement> {
+    if (element.type !== 'file') return element;
+
+    const source = (element.url ?? '').trim();
+    if (source && !element.fileId) {
+      const uploaded = await this.uploadForwardFileSource(source, fileNameForUpload(element), groupId, userId);
+      return {
+        ...stripFileSource(element),
+        ...uploaded,
+      };
+    }
+
+    if (element.fileId) {
+      const cached = this.ctx.recallUploadedFile(element.fileId);
+      if (isCachedFileUsableInTarget(cached, groupId, userId)) return element;
+      const sourceFromCache = await this.downloadSourceFromCachedFile(cached!);
+      const uploaded = await this.uploadForwardFileSource(
+        sourceFromCache,
+        fileNameForUpload(element, cached),
+        groupId,
+        userId,
+      );
+      return {
+        ...stripFileSource(element),
+        ...uploaded,
+      };
+    }
+
+    return element;
+  }
+
+  private async prepareForwardFiles(
+    nodes: ForwardNodePayload[],
+    groupId?: number,
+    userId?: number,
+  ): Promise<ForwardNodePayload[]> {
+    return Promise.all(nodes.map(async (node) => {
+      const elements = await Promise.all(node.elements.map(
+        element => this.prepareForwardFileElement(element, groupId, userId),
+      ));
+      return cloneNodeWithElements(node, elements);
+    }));
   }
 
   /**
@@ -304,8 +450,10 @@ export class ForwardApi {
       }
     }
 
+    const uploadReadyNodes = await this.prepareForwardFiles(processedNodes, groupId, userId);
+
     // Encode this level's msgBody.
-    const msgBody = await Promise.all(processedNodes.map(
+    const msgBody = await Promise.all(uploadReadyNodes.map(
       node => buildForwardPushBody(bridge, node, groupId, userUid),
     ));
 
@@ -349,7 +497,7 @@ export class ForwardApi {
       throw new Error('upload forward message response missing res_id');
     }
 
-    forwardResCache.set(resId, processedNodes.map(node => ({
+    forwardResCache.set(resId, uploadReadyNodes.map(node => ({
       userUin: node.userUin,
       nickname: node.nickname,
       elements: [...node.elements],
@@ -381,7 +529,7 @@ export class ForwardApi {
     const bridge = asBridge(this.ctx);
     const cached = forwardResCache.get(resId);
     if (cached) {
-      return cached.map(node => ({
+      const nodes = cached.map(node => ({
         userUin: node.userUin,
         nickname: node.nickname,
         elements: [...node.elements],
@@ -392,6 +540,10 @@ export class ForwardApi {
         senderCard: node.senderCard,
         messageType: node.messageType,
       }));
+      // Inner nodes seeded by consumePiggybacks are cached un-enriched; enrich
+      // on read (a no-op once names are present) and persist so later hits skip.
+      if (await this.enrichSenders(nodes)) forwardResCache.set(resId, cloneNodes(nodes));
+      return nodes;
     }
 
     const selfUid = await resolveSelfUid(bridge);
@@ -451,10 +603,94 @@ export class ForwardApi {
       this.consumePiggybacks(nodes, piggybackByUuid);
     }
 
+    // Fill sender nickname/card for nodes the SsoRecvLongMsg payload left empty
+    // or stamped with the "QQ用户" placeholder (#174) — the long-msg member name
+    // isn't always populated, and the sync decode only consults the L1 cache.
+    await this.enrichSenders(nodes);
+
     if (nodes.length > 0) {
       forwardResCache.set(resId, cloneNodes(nodes));
     }
     return nodes;
+  }
+
+  /** A node whose display name the server didn't give us (empty or the QQ
+   *  placeholder) and that we can resolve (has a uin). */
+  private needsName(n: ForwardNodePayload): boolean {
+    return !!n.userUin && (!n.nickname || n.nickname === FORWARD_NAME_PLACEHOLDER);
+  }
+
+  /** Backfill sender nickname/card on forward nodes the long-msg payload left
+   *  nameless. Resolves group senders via one member-list fetch per group (L3,
+   *  inflight+TTL cached in ContactsApi), then any residue + private nodes via
+   *  the user-profile lookup (L4). Best-effort: a failed lookup keeps the
+   *  placeholder rather than failing the whole forward. Returns true if any
+   *  node was changed (so callers can persist the enriched cache). */
+  private async enrichSenders(nodes: ForwardNodePayload[]): Promise<boolean> {
+    const pending = nodes.filter(n => this.needsName(n));
+    if (pending.length === 0) return false;
+    let changed = false;
+
+    // L3 — group member lists (one fetch resolves every sender from that group).
+    const byGroup = new Map<number, ForwardNodePayload[]>();
+    const residue: ForwardNodePayload[] = [];
+    for (const n of pending) {
+      if (n.messageType === 'group' && n.groupId) {
+        const arr = byGroup.get(n.groupId) ?? [];
+        arr.push(n);
+        byGroup.set(n.groupId, arr);
+      } else {
+        residue.push(n);
+      }
+    }
+    for (const [groupId, groupNodes] of byGroup) {
+      let byUin: Map<number, { nickname: string; card: string }>;
+      try {
+        const members = await this.ctx.apis.contacts.fetchGroupMemberList(groupId);
+        byUin = new Map(members.map(m => [m.uin, { nickname: m.nickname, card: m.card }]));
+      } catch {
+        // Member list (one cheap, cached call) failed — keep the placeholder
+        // rather than fanning the whole group out to per-uin profile lookups.
+        // That error path is exactly what would amplify into a rate-limit ban.
+        continue;
+      }
+      for (const n of groupNodes) {
+        const m = byUin.get(n.userUin);
+        const name = m?.card || m?.nickname;
+        if (name) {
+          n.senderCard = m!.card || n.senderCard || '';
+          n.nickname = name;
+          changed = true;
+        } else {
+          residue.push(n); // in-group sender that left the group → profile fallback
+        }
+      }
+    }
+
+    // L4 — user profile for the residue (members who left the group, private
+    // nodes). fetchUserProfile is an un-cached single-point OIDB 0xFE1_2, and
+    // Tencent rate-limits these hard (see ContactsApi's member-list note), so:
+    // dedupe by uin, CAP the count (drop the rest to placeholder), and resolve
+    // in small concurrency-limited batches. Best-effort.
+    const uins = [...new Set(residue.filter(n => this.needsName(n)).map(n => n.userUin))]
+      .slice(0, FORWARD_PROFILE_MAX);
+    if (uins.length > 0) {
+      const byUin = new Map<number, string>();
+      for (let i = 0; i < uins.length; i += FORWARD_PROFILE_CONCURRENCY) {
+        const batch = uins.slice(i, i + FORWARD_PROFILE_CONCURRENCY);
+        const results = await Promise.all(batch.map(async (uin): Promise<readonly [number, string]> => {
+          try { return [uin, (await this.ctx.apis.contacts.fetchUserProfile(uin)).nickname] as const; }
+          catch { return [uin, ''] as const; }
+        }));
+        for (const [uin, nick] of results) byUin.set(uin, nick);
+      }
+      for (const n of residue) {
+        if (!this.needsName(n)) continue;
+        const nick = byUin.get(n.userUin);
+        if (nick) { n.nickname = nick; changed = true; }
+      }
+    }
+    return changed;
   }
 
   /** Walk a list of PushMsgBody, run each through the regular msg-push

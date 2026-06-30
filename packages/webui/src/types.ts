@@ -97,19 +97,32 @@ export interface OneBotNetworks {
   wsClients: WsClientNetwork[];
 }
 
-/** Built-in `#sl` status command settings (trigger word is hardcoded). */
+/** Built-in status command settings. Trigger word is configurable. */
 export interface StatusCommandConfig {
   enabled: boolean;
   swallow: boolean;
   cooldownSeconds: number;
+  trigger: string;
 }
 
 export interface OneBotConfig {
   networks: OneBotNetworks;
-  musicSignUrl?: string;
   statusCommand: StatusCommandConfig;
   /** Per-account opt-in to global notification channels (by channel id). */
   notifications?: { channelIds: string[] };
+}
+
+// ─── Global deployment settings (config/snowluma.json) ──────────────────────
+// All-accounts SnowLuma knobs that aren't per-UIN: rkey fallback servers and
+// the music-card signing endpoint. Mirrors @snowluma/onebot/global-config.
+export interface RKeyConfig {
+  fallbackServers: string[];
+}
+
+export interface GlobalSettings {
+  rkey: RKeyConfig;
+  /** Music-card signing service URL. Empty = built-in default. */
+  musicSignUrl: string;
 }
 
 // ─── Notifications (account up/down webhooks) ───────────────────────────────
@@ -158,7 +171,25 @@ export interface SystemSettingsResponse {
   restartRequiredToApply: boolean;
 }
 
-// Debug tools (Wave A3).
+// Debug tools (Wave A3; roles + streaming added in the console expansion).
+
+/** Semantic role of a param, mirrored from the backend's `FieldRole`. Drives
+ *  which smart widget the tester renders. Unknown values degrade to the plain
+ *  typed control, so this list can lag the backend without breaking. */
+export type FieldRole =
+  | 'group_id'
+  | 'user_id'
+  | 'member_id'
+  | 'message_id'
+  | 'file_id'
+  | 'file'
+  | 'image'
+  | 'record'
+  | 'video'
+  | 'duration'
+  | 'timestamp'
+  | 'face_id';
+
 export interface DebugActionParam {
   name: string;
   type: string;
@@ -166,6 +197,8 @@ export interface DebugActionParam {
   default?: unknown;
   desc?: string;
   values?: (string | number)[];
+  /** Semantic role (group_id / user_id / image / …) for widget selection. */
+  role?: FieldRole;
 }
 export interface DebugActionDoc {
   name: string;
@@ -174,7 +207,32 @@ export interface DebugActionDoc {
   summary?: string;
   returns?: string;
   readOnly: boolean;
+  /** True for Stream API actions — invoke via the streaming transport. */
+  stream?: boolean;
+  /** Cross-field constraints, for display in the tester / API browser. */
+  invariants?: string[];
   params: DebugActionParam[];
+}
+
+/** One frame relayed from /api/debug/invoke-stream — an OB11 envelope carrying
+ *  the stream marker. Intermediate frames have `data.type` of stream/error;
+ *  the terminal frame mirrors the action's final response. */
+export interface DebugStreamFrame {
+  status: string;
+  retcode?: number;
+  data?: unknown;
+  message?: string;
+  wording?: string;
+  stream?: string;
+  echo?: unknown;
+}
+
+/** Result of POST /api/debug/upload — a path on the SERVER for a send action. */
+export interface DebugUploadResult {
+  status: string;
+  path?: string;
+  size?: number;
+  message?: string;
 }
 export interface DebugInvokeResult {
   status: string;

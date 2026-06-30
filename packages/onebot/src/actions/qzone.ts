@@ -3,6 +3,24 @@ import type { ApiActionContext, ApiHandler } from '../api-handler';
 import type { JsonValue } from '../types';
 import { RETCODE, failedResponse, okResponse } from '../types';
 
+async function uploadQzoneImages(
+  ctx: ApiActionContext,
+  images: string[],
+  select: (upload: { richval: string; url: string }) => string,
+): Promise<string> {
+  const parts: string[] = [];
+  for (let i = 0; i < images.length; i++) {
+    try {
+      const upload = await ctx.bridge.apis.qzone.uploadImageFromSource(images[i]);
+      parts.push(select(upload));
+    } catch (error) {
+      const message = error instanceof Error ? error.message : 'unknown error';
+      throw new Error(`第 ${i + 1} 张图片上传失败: ${message}`);
+    }
+  }
+  return parts.join('\t');
+}
+
 export const actions = [
   // get_qzone_msg_list — 获取 QQ 空间说说列表。无 go-cqhttp 标准，自定义命名。
   // 默认取机器人自己的空间；传 target_uin 可查看指定账号（需有权限）。
@@ -10,9 +28,33 @@ export const actions = [
   defineAction({
     name: 'get_qzone_msg_list',
     readOnly: true,
+    returns: '说说列表对象，含说说总数与本页说说数组。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        total: { type: 'integer', description: '账号说说总数（非本页数量）' },
+        msglist: {
+          type: 'array',
+          description: '本页说说数组',
+          items: {
+            type: 'object',
+            properties: {
+              tid: { type: 'string', description: '说说 id（delete/comment/like 的句柄）' },
+              content: { type: 'string', description: '说说正文' },
+              time: { type: 'integer', description: '发表时间（unix 秒）' },
+              comment_num: { type: 'integer', description: '评论数' },
+              is_private: { type: 'boolean', description: '是否仅自己可见' },
+              images: { type: 'array', items: { type: 'string' }, description: '图片 URL 列表（每图取最大可用变体）' },
+            },
+            required: ['tid', 'content', 'time', 'comment_num', 'is_private', 'images'],
+          },
+        },
+      },
+      required: ['total', 'msglist'],
+    },
     summary: '获取 QQ 空间说说列表（默认机器人自己的空间）',
     params: {
-      target_uin: f.uint().describe('目标 QQ 号，省略则取机器人自己').optional(),
+      target_uin: f.userId().describe('目标 QQ 号，省略则取机器人自己').optional(),
       pos: f.int({ min: 0 }).describe('起始偏移').default(0),
       num: f.int({ min: 1, max: 100 }).describe('本页数量').default(20),
     },
@@ -32,6 +74,30 @@ export const actions = [
   defineAction({
     name: 'get_qzone_feeds',
     readOnly: true,
+    returns: '好友动态对象，含本页 feed 数组与是否有更多页。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        feeds: {
+          type: 'array',
+          description: '本页好友动态数组',
+          items: {
+            type: 'object',
+            properties: {
+              uin: { type: 'integer', description: '动态作者 QQ 号' },
+              nickname: { type: 'string', description: '作者昵称' },
+              time: { type: 'integer', description: '发表时间（unix 秒）' },
+              appid: { type: 'integer', description: 'Qzone 应用 id（311=说说，4=相册，…）' },
+              key: { type: 'string', description: 'feed 句柄（Qzone 用于定位该条动态）' },
+              html: { type: 'string', description: '预渲染 HTML 原样透传' },
+            },
+            required: ['uin', 'nickname', 'time', 'appid', 'key', 'html'],
+          },
+        },
+        has_more: { type: 'boolean', description: '服务端是否报告本页之后还有更多页' },
+      },
+      required: ['feeds', 'has_more'],
+    },
     summary: '获取 QQ 空间好友动态（feed）；page_num 仅首页可靠，深翻页需时间游标（暂未实现）',
     params: {
       page_num: f.int({ min: 1 }).describe('页码（1 起；仅首页可靠）').default(1),
@@ -48,17 +114,24 @@ export const actions = [
     },
   }),
 
-  // send_qzone_msg — 发表一条纯文字说说。写操作，发到机器人自己的空间。
+  // send_qzone_msg — 发表说说（纯文字或带图）。写操作，发到机器人自己的空间。
+  // 传入 images 数组，自动上传并发布。
   // 返回新说说的 tid（供后续 delete/comment/like 使用）。
   // 注意：发说说为主动行为，高频会被 Qzone 风控，调用方需自行限流。
   defineAction({
     name: 'send_qzone_msg',
-    summary: '发表一条纯文字说说（QQ 空间）',
+    summary: '发表说说（QQ 空间，支持纯文字或带图；传 images 自动上传）',
     params: {
       content: f.string({ allowEmpty: false }).describe('说说正文'),
+      images: f.array(f.string({ allowEmpty: false })).describe('图片数组（可选），支持 file:// http:// base64://；自动上传').optional(),
     },
     run: async (p, ctx) => {
       try {
+        if (p.images && p.images.length > 0) {
+          const richval = await uploadQzoneImages(ctx, p.images, (upload) => upload.richval);
+          const res = await ctx.bridge.apis.qzone.publish(p.content, 1, richval);
+          return okResponse(res as unknown as JsonValue);
+        }
         const res = await ctx.bridge.apis.qzone.publish(p.content);
         return okResponse(res as unknown as JsonValue);
       } catch (error) {
@@ -94,8 +167,8 @@ export const actions = [
     summary: '给一条说说点赞（QQ 空间）',
     params: {
       tid: f.string({ allowEmpty: false }).describe('说说 tid'),
-      target_uin: f.uint().describe('说说所属 QQ 号，省略则为机器人自己').optional(),
-      abstime: f.int({ min: 0 }).describe('说说发表时间（unix 秒），传真实值更可靠').default(0),
+      target_uin: f.userId().describe('说说所属 QQ 号，省略则为机器人自己').optional(),
+      abstime: f.int({ min: 0 }).describe('说说发表时间（unix 秒），传真实值更可靠').default(0).role('timestamp'),
     },
     run: async (p, ctx) => {
       try {
@@ -115,8 +188,8 @@ export const actions = [
     summary: '取消对一条说说的点赞（QQ 空间；取消赞端点待真机核实）',
     params: {
       tid: f.string({ allowEmpty: false }).describe('说说 tid'),
-      target_uin: f.uint().describe('说说所属 QQ 号，省略则为机器人自己').optional(),
-      abstime: f.int({ min: 0 }).describe('说说发表时间（unix 秒），传真实值更可靠').default(0),
+      target_uin: f.userId().describe('说说所属 QQ 号，省略则为机器人自己').optional(),
+      abstime: f.int({ min: 0 }).describe('说说发表时间（unix 秒），传真实值更可靠').default(0).role('timestamp'),
     },
     run: async (p, ctx) => {
       try {
@@ -130,17 +203,24 @@ export const actions = [
   }),
 
   // comment_qzone — 评论一条说说。target_uin=说说所属 QQ 号（省略=机器人自己空间）。
+  // 传入 images 数组，自动上传获取直链（多图用 tab 拼接）。
   // 写操作；高频评论会被 Qzone 风控，调用方需限流。
   defineAction({
     name: 'comment_qzone',
-    summary: '评论一条说说（QQ 空间）',
+    summary: '评论一条说说（QQ 空间，支持纯文字或带图；传 images 自动上传）',
     params: {
       tid: f.string({ allowEmpty: false }).describe('说说 tid'),
       content: f.string({ allowEmpty: false }).describe('评论内容'),
-      target_uin: f.uint().describe('说说所属 QQ 号，省略则为机器人自己').optional(),
+      target_uin: f.userId().describe('说说所属 QQ 号，省略则为机器人自己').optional(),
+      images: f.array(f.string({ allowEmpty: false })).describe('图片数组（可选），支持 file:// http:// base64://；自动上传').optional(),
     },
     run: async (p, ctx) => {
       try {
+        if (p.images && p.images.length > 0) {
+          const richval = await uploadQzoneImages(ctx, p.images, (upload) => upload.url);
+          const res = await ctx.bridge.apis.qzone.comment(p.tid, p.content, p.target_uin, 1, richval);
+          return okResponse(res as unknown as JsonValue);
+        }
         const res = await ctx.bridge.apis.qzone.comment(p.tid, p.content, p.target_uin);
         return okResponse(res as unknown as JsonValue);
       } catch (error) {

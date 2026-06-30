@@ -80,6 +80,16 @@ describe('video-upload', () => {
     expect(uploads[1]!.fastOnlyError).toBeUndefined();
   });
 
+  it('does NOT set a force-full retry flag on the main file (#145 — proven ineffective)', async () => {
+    // The old forceFullOnFastPath retry was removed: real-machine + kernel RE
+    // showed it never forces a fresh upload (the server fast-paths by md5
+    // metadata regardless of tryFastUploadCompleted). An expired-but-indexed
+    // video resource is a platform limitation, not an upload-flow fix.
+    await uploadVideoMsgInfo({} as any, true, 12345, FINGERPRINT);
+    const uploads = vi.mocked(pipeline.runNtv2Upload).mock.calls[0]![0].uploads;
+    expect((uploads[0] as unknown as Record<string, unknown>).forceFullOnFastPath).toBeUndefined();
+  });
+
   it('uploadInfo carries TWO entries (main mp4 + thumb jpg) with subFileType 0 and 100', async () => {
     await uploadVideoMsgInfo({} as any, true, 12345, FINGERPRINT);
     const uploadInfo = vi.mocked(pipeline.runNtv2Upload).mock.calls[0]![0].uploadInfo;

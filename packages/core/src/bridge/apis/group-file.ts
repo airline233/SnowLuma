@@ -100,8 +100,14 @@ function normalizeUploadFileName(name: string, fallback: string): string {
   return safeFallback || 'file.bin';
 }
 
+// QQ's "first 10 MB" checksum uses the magic limit 0x98A000 (10002432) —
+// NOT 10*1024*1024 and not 10^7. Using the wrong limit makes the server's
+// first-block verification fail for files larger than 0x98A000, so the
+// offline file uploads but never finalises as downloadable (#157).
+const MD5_HEAD_LIMIT = 10002432;
+
 function md5First10MB(bytes: Uint8Array): Uint8Array {
-  const limit = Math.min(bytes.length, 10 * 1024 * 1024);
+  const limit = Math.min(bytes.length, MD5_HEAD_LIMIT);
   return computeMd5(bytes.subarray(0, limit));
 }
 
@@ -177,7 +183,12 @@ function buildPrivateFileUploadExt(
     unknown2: 1,
     entry: {
       busiBuff: {
-        busId: 102,
+        // #157: NapCat/Lagrange (and the QQ client, confirmed by packet
+        // capture) emit a busiBuff with ONLY senderUin — no busId. A stale
+        // busId:102 here made the offline-file server accept the highway
+        // upload but never finalise it as downloadable once the file got
+        // big (>5 MiB): the receiver saw the file but every download failed.
+        // (The other half of that bug was the wrong md5-head limit above.)
         senderUin: BigInt(senderUin),
         receiverUin: 0n,
         groupCode: 0n,
@@ -241,6 +252,7 @@ export class GroupFileApi {
     name = '',
     folderId = '/',
     uploadFile = true,
+    publishFile = uploadFile,
   ): Promise<UploadFileResult> {
     const bridge = asBridge(this.ctx);
     // Group/private files may legitimately be up to 4 GiB on QQ's wire,
@@ -316,11 +328,11 @@ export class GroupFileApi {
     // the chat shows nothing. The publish step goes via a dedicated OIDB
     // call (0x6D9_4), NOT via `MessageSvc.PbSendMsg` with a transElem(24)
     // payload — the QQ-NT server rejects that with `result=79`. Mirrors
-    // Lagrange.Core V2's `GroupSendFileService.cs`. Suppressed when the
-    // caller opts out via `uploadFile=false` (treat that as "I only
-    // wanted the slot allocated, hold the chat post"). Routes through
-    // `this.publish` so tests can mock at the same Api boundary.
-    if (uploadFile) {
+    // Lagrange.Core V2's `GroupSendFileService.cs`. Suppressed when a
+    // caller only needs a valid file_id embedded elsewhere, e.g. a
+    // forward-message long-msg payload. Routes through `this.publish` so
+    // tests can mock at the same Api boundary.
+    if (publishFile) {
       try {
         await this.publish(groupId, fileId);
       } catch (err) {
@@ -341,6 +353,7 @@ export class GroupFileApi {
     source: string,
     name = '',
     uploadFile = true,
+    publishFile = uploadFile,
   ): Promise<UploadFileResult> {
     const bridge = asBridge(this.ctx);
     const loaded = await loadBinarySource(source, 'file', FILE_UPLOAD_MAX_BYTES);
@@ -482,7 +495,7 @@ export class GroupFileApi {
     // which only knows about elems[]. NapCat does the same atomic
     // upload+send dance — without it the file sits on the server and
     // the recipient sees nothing.
-    if (uploadFile) {
+    if (publishFile) {
       try {
         await this.ctx.apis.message.sendC2cFile(userId, targetUid, {
           fileId,

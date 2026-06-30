@@ -21,9 +21,16 @@ const CONFIG_DIR = 'config';
 const DEFAULT_CONFIG_PATH = path.join(CONFIG_DIR, 'onebot.json');
 const DEFAULT_ACCESS_TOKEN_BYTES = 32;
 
-const DEFAULT_STATUS_COMMAND: StatusCommandConfig = { enabled: true, swallow: false, cooldownSeconds: 5 };
-/** Upper bound on the `#sl` reply cooldown — a year is effectively "off but sane". */
+const DEFAULT_STATUS_COMMAND: StatusCommandConfig = {
+  enabled: true,
+  swallow: false,
+  cooldownSeconds: 5,
+  trigger: '#sl',
+};
+/** Upper bound on the status-command reply cooldown — a year is effectively "off but sane". */
 const STATUS_COMMAND_COOLDOWN_MAX = 31_536_000;
+/** Max length of a user-customised trigger word (UTF-16 code units). */
+export const STATUS_COMMAND_TRIGGER_MAX_LENGTH = 32;
 
 function makeDefaultStatusCommand(): StatusCommandConfig {
   return { ...DEFAULT_STATUS_COMMAND };
@@ -54,7 +61,6 @@ export function makeDefaultOneBotConfig(): OneBotConfig {
       }],
       wsClients: [],
     },
-    musicSignUrl: '',
     statusCommand: makeDefaultStatusCommand(),
     notifications: { channelIds: [] },
   };
@@ -108,11 +114,11 @@ function toJsonObject(config: OneBotConfig): JsonObject {
       wsServers: nets.wsServers.map(wsServerToJson),
       wsClients: nets.wsClients.map(wsClientToJson),
     },
-    musicSignUrl: config.musicSignUrl ?? '',
     statusCommand: {
       enabled: config.statusCommand.enabled,
       swallow: config.statusCommand.swallow,
       cooldownSeconds: config.statusCommand.cooldownSeconds,
+      trigger: config.statusCommand.trigger,
     },
     notifications: { channelIds: config.notifications?.channelIds ?? [] },
   };
@@ -171,12 +177,10 @@ function wsClientToJson(n: WsClientNetwork): JsonObject {
 function fromJson(sources: JsonObject[], freshInstall: boolean): OneBotConfig {
   let legacyFormat: MessageFormat | undefined;
   let legacyReport: boolean | undefined;
-  let musicSignUrl = '';
   for (const src of sources) {
     const mf = parseMessageFormat(src.messageFormat);
     if (mf) legacyFormat = mf;
     if (typeof src.reportSelfMessage === 'boolean') legacyReport = src.reportSelfMessage;
-    if (typeof src.musicSignUrl === 'string') musicSignUrl = src.musicSignUrl;
   }
   const inheritedFormat: MessageFormat = legacyFormat ?? 'array';
   const inheritedReport: boolean = legacyReport ?? false;
@@ -200,7 +204,6 @@ function fromJson(sources: JsonObject[], freshInstall: boolean): OneBotConfig {
   const networks: OneBotNetworks = { httpServers, httpClients, wsServers, wsClients };
   return {
     networks,
-    musicSignUrl,
     statusCommand: parseStatusCommand(sources),
     notifications: parseNotifications(sources),
   };
@@ -249,6 +252,9 @@ function parseStatusCommand(sources: JsonObject[]): StatusCommandConfig {
         STATUS_COMMAND_COOLDOWN_MAX,
         asNumber(raw.cooldownSeconds, DEFAULT_STATUS_COMMAND.cooldownSeconds),
       );
+    }
+    if (typeof raw.trigger === 'string' && raw.trigger.trim().length > 0 && !/[\r\n]/.test(raw.trigger)) {
+      out.trigger = raw.trigger.trim().slice(0, STATUS_COMMAND_TRIGGER_MAX_LENGTH);
     }
   }
   return out;

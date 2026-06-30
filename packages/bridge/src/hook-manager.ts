@@ -6,10 +6,12 @@ import { HookSession, type HookSessionDeps } from './hook-session';
 import {
   injectHookProcess,
   listHookProcesses,
+  resolveHookNativePath,
   unloadHookProcess,
   type HookProcessBaseInfo,
 } from './injector';
 import { PipeWatcher } from './pipe-watcher';
+import { createNativeProcessEnumerator, type ProcessEnumerator } from './process-enumerator';
 import { QqHookClient } from './qq-hook-client';
 import { probeQqLoginInfo, type QqPortLoginInfo } from './qq-port-probe';
 import type { HookProcessInfo } from './types';
@@ -49,6 +51,13 @@ export type HookManagerDeps = {
    * `loadProcess(pid)` from the watcher's 'process-discovered' handler).
    * Failed loads are logged and leave the session in the 'error' state. */
   autoLoadOnDiscovery?: boolean;
+  /** Optional hook fired whenever the set of HookProcessInfo observable to
+   * `listProcesses()` changes — new process discovered, process gone, or
+   * any session's status mutated. Used by the WebUI SSE wiring to push a
+   * fresh processes snapshot to connected clients without REST polling.
+   * Exceptions thrown by the callback are caught and logged; they do not
+   * break the watcher / session event loops. */
+  onSessionsChanged?: () => void;
   log?: Logger;
 };
 
@@ -74,8 +83,15 @@ export class HookManager {
   private readonly makeClient: HookSessionDeps['makeClient'];
   private readonly pipeWatcher: PipeWatcher;
   private readonly ownsPipeWatcher: boolean;
-  private readonly listProcessesNative: () => HookProcessBaseInfo[];
+  /** Watcher/API process enumeration — isolated + timeout-bounded by default
+   *  so a blocked native /proc walk can't freeze the loop (issue #158).
+   *  Resolves to `null` (UNKNOWN) on timeout/failure. */
+  private readonly enumerate: () => Promise<HookProcessBaseInfo[] | null>;
+  /** The owned enumerator (worker lifecycle), or null when a custom lister was
+   *  injected (tests) — nothing to tear down in that case. */
+  private readonly enumerator: ProcessEnumerator | null;
   private readonly autoLoadOnDiscovery: boolean;
+  private readonly onSessionsChangedRaw?: () => void;
   private readonly log: Logger;
   private readonly sessions = new Map<number, HookSession>();
   private readonly startPromise: Promise<void>;
@@ -85,6 +101,7 @@ export class HookManager {
   constructor(deps: HookManagerDeps) {
     this.bridgeManager = deps.bridgeManager;
     this.onPacket = deps.onPacket ?? ((pkt) => deps.bridgeManager.onPacket(pkt));
+    this.onSessionsChangedRaw = deps.onSessionsChanged;
     this.log = deps.log ?? createLogger('Hook');
 
     this.injector = deps.injector ?? {
@@ -95,15 +112,38 @@ export class HookManager {
       },
     };
     this.makeClient = deps.makeClient ?? ((pid: number) => new QqHookClient(pid));
-    this.listProcessesNative = deps.listProcesses ?? listHookProcesses;
     this.autoLoadOnDiscovery = deps.autoLoadOnDiscovery ?? false;
+
+    // A custom lister (tests) is used directly — no worker, no isolation, just
+    // an async wrap that maps a throw to the UNKNOWN sentinel. The default path
+    // wraps the native enumerator in a worker with a timeout.
+    if (deps.listProcesses) {
+      const lister = deps.listProcesses;
+      this.enumerator = null;
+      this.enumerate = async () => {
+        try {
+          return await lister();
+        } catch (error) {
+          this.log.warn('listProcesses failed: %s', errMsg(error));
+          return null;
+        }
+      };
+    } else {
+      this.enumerator = createNativeProcessEnumerator({
+        addonPath: resolveHookNativePath('node'),
+        fallbackSync: listHookProcesses,
+        processName: defaultProcessName(),
+        log: this.log,
+      });
+      this.enumerate = () => this.enumerator!.enumerate();
+    }
 
     if (deps.pipeWatcher) {
       this.pipeWatcher = deps.pipeWatcher;
       this.ownsPipeWatcher = false;
     } else {
       this.pipeWatcher = new PipeWatcher({
-        listProcesses: this.listProcessesNative,
+        listProcesses: this.enumerate,
         listLivePipes: () => QqHookClient.listLivePipes(),
         intervalMs: deps.watcherIntervalMs,
         log: this.log,
@@ -119,12 +159,13 @@ export class HookManager {
 
   async listProcesses(): Promise<HookProcessInfo[]> {
     await this.startPromise;
-    let processes: HookProcessBaseInfo[];
-    try {
-      processes = this.listProcessesNative();
-    } catch (error) {
-      this.log.warn('listProcesses failed: %s', errMsg(error));
-      processes = [];
+    const processes = await this.enumerate();
+    if (processes === null) {
+      // Enumeration timed out / failed — report the last-known sessions rather
+      // than an empty list (which the WebUI would render as "no QQ").
+      return [...this.sessions.values()]
+        .map((s) => s.toInfo())
+        .sort((a, b) => a.pid - b.pid);
     }
     const result: HookProcessInfo[] = [];
     for (const proc of processes) {
@@ -172,6 +213,7 @@ export class HookManager {
       session.dispose();
     }
     this.sessions.clear();
+    this.enumerator?.dispose();
     if (this.ownsPipeWatcher) {
       this.pipeWatcher.dispose();
     }
@@ -193,11 +235,13 @@ export class HookManager {
           this.log.warn('auto-load failed: PID=%d err=%s', info.pid, errMsg(err));
         });
       }
+      this.notifySessionsChanged();
     });
     this.pipeWatcher.on('process-gone', (pid: number) => {
       if (this.disposed) return;
       const session = this.sessions.get(pid);
       if (session) session.notifyProcessGone();
+      this.notifySessionsChanged();
     });
     this.pipeWatcher.on('pipe-up', (pid: number) => {
       if (this.disposed) return;
@@ -253,12 +297,31 @@ export class HookManager {
     session.on('disconnected', (wasLoggedIn: boolean) => {
       if (wasLoggedIn) this.bridgeManager.onPidDisconnected(pid);
     });
+    // status-changed fires on EVERY internal status mutation, including the
+    // ones reached via login / disconnected / refresh — subscribing here
+    // alone covers every transition the WebUI processes view cares about.
+    session.on('status-changed', () => {
+      this.notifySessionsChanged();
+    });
     session.on('disposed', () => {
       this.sessions.delete(pid);
     });
 
     this.sessions.set(pid, session);
     return session;
+  }
+
+  /** Fire the optional sessions-changed hook with exceptions isolated.
+   * A throwing subscriber must not abort the watcher's emit loop or break
+   * a HookSession event handler in flight. */
+  private notifySessionsChanged(): void {
+    if (this.disposed) return;
+    if (!this.onSessionsChangedRaw) return;
+    try {
+      this.onSessionsChangedRaw();
+    } catch (err) {
+      this.log.warn('onSessionsChanged threw: %s', errMsg(err));
+    }
   }
 
   private assertValidPid(pid: number): void {

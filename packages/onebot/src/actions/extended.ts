@@ -141,7 +141,7 @@ export const actions = [
     name: 'send_like',
     summary: '点赞',
     params: {
-      user_id: f.uint(),
+      user_id: f.userId(),
       // 原实现用 `asNumber(times) || 1`，present 0 会被当作缺省 1。
       times: f.int({ min: 0 }).default(1),
     },
@@ -155,8 +155,8 @@ export const actions = [
     name: 'friend_poke',
     summary: '好友拍一拍',
     params: {
-      user_id: f.uint(),
-      target_id: f.uint().optional(),
+      user_id: f.userId(),
+      target_id: f.userId().optional(),
     },
     run: async (p, ctx) => {
       await ctx.bridge.apis.interaction.sendPoke(false, p.user_id, p.target_id);
@@ -177,8 +177,8 @@ export const actions = [
     name: 'send_poke',
     summary: '拍一拍（群聊/私聊自动路由）',
     params: {
-      user_id: f.uint(),
-      group_id: f.uint().optional(),
+      user_id: f.userId(),
+      group_id: f.groupId().optional(),
     },
     run: async (p, ctx) => {
       if (p.group_id) {
@@ -233,7 +233,7 @@ export const actions = [
     name: 'set_group_reaction',
     summary: '群聊表情回应',
     params: {
-      group_id: f.uint().optional(),
+      group_id: f.groupId().optional(),
       message_id: f.messageId(),
       code: f.string({ allowEmpty: false }),
       is_set: f.bool().default(true),
@@ -272,7 +272,7 @@ export const actions = [
   defineAction({
     name: 'add_custom_face',
     summary: '添加收藏表情',
-    params: { file: f.string({ allowEmpty: false }) },
+    params: { file: f.image() },
     run: async (p, ctx) => {
       try {
         const emojiId = await ctx.bridge.apis.profile.addCustomFace(p.file);
@@ -325,13 +325,21 @@ export const actions = [
     name: 'get_group_msg_history',
     summary: '获取群消息历史',
     readOnly: true,
+    returns: '{ messages }：群消息事件对象数组（每项为 OneBot 消息事件，内部字段不固定）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        messages: { type: 'array', description: '消息事件对象数组', items: { type: 'object' } },
+      },
+      required: ['messages'],
+    },
     params: {
       // message_id is a signed int32 hash (hashMessageIdInt32) and is
       // frequently NEGATIVE — a `{min:0}` validator rejects a real anchor at
       // param-validation time (retcode 1400) before run() ever fires. Use a
       // plain signed int; `.default(0)` keeps absent/present-0 → "fetch latest"
       // (matches the original `asNumber(message_id) || 0`). `count` stays ≥0.
-      message_id: f.int().default(0),
+      message_id: f.int().default(0).role('message_id'),
       count: f.int({ min: 0 }).default(20),
     },
     run: async (p, ctx) => {
@@ -344,10 +352,18 @@ export const actions = [
     name: 'get_friend_msg_history',
     summary: '获取好友消息历史',
     readOnly: true,
+    returns: '{ messages }：好友消息事件对象数组（每项为 OneBot 消息事件，内部字段不固定）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        messages: { type: 'array', description: '消息事件对象数组', items: { type: 'object' } },
+      },
+      required: ['messages'],
+    },
     params: {
-      user_id: f.uint(),
+      user_id: f.userId(),
       // Signed int32 hash, frequently negative — see get_group_msg_history.
-      message_id: f.int().default(0),
+      message_id: f.int().default(0).role('message_id'),
       count: f.int({ min: 0 }).default(20),
     },
     run: async (p, ctx) => {
@@ -362,7 +378,7 @@ export const actions = [
     summary: '标记群消息已读',
     params: {
       message_id: f.messageId(),
-      group_id: f.uint().optional(),
+      group_id: f.groupId().optional(),
     },
     run: async (p, ctx) => {
       const meta = ctx.getMessageMeta(p.message_id);
@@ -384,7 +400,7 @@ export const actions = [
     summary: '标记私聊消息已读',
     params: {
       message_id: f.messageId(),
-      user_id: f.uint().optional(),
+      user_id: f.userId().optional(),
     },
     run: async (p, ctx) => {
       const meta = ctx.getMessageMeta(p.message_id);
@@ -431,7 +447,7 @@ export const actions = [
     summary: '发送群公告',
     params: {
       content: f.string({ allowEmpty: false }),
-      image: f.string().default(''),
+      image: f.string().default('').role('image'),
       pinned: f.raw(),
       type: f.raw(),
       confirm_required: f.raw(),
@@ -474,7 +490,7 @@ export const actions = [
     params: {
       messages: f.message().optional(),
       message: f.message().optional(),
-      group_id: f.uint().optional(),
+      group_id: f.groupId().optional(),
     },
     run: async (p, ctx) => {
       const messages = p.messages ?? p.message;
@@ -498,7 +514,7 @@ export const actions = [
     params: {
       messages: f.message().optional(),
       message: f.message().optional(),
-      group_id: f.uint().optional(),
+      group_id: f.groupId().optional(),
     },
     run: async (p, ctx) => {
       const messages = p.messages ?? p.message;
@@ -515,8 +531,8 @@ export const actions = [
     summary: '获取图片信息',
     readOnly: true,
     params: {
-      file: f.string().default(''),
-      file_id: f.string().default(''),
+      file: f.string().default('').role('image'),
+      file_id: f.string().default('').role('file_id'),
     },
     run: async (p, ctx) => {
       const file = p.file || p.file_id;
@@ -529,18 +545,32 @@ export const actions = [
 
   defineAction({
     name: 'get_record',
-    summary: '获取语音信息',
+    summary: '获取语音信息；传 out_format 则服务端转码并附带 base64',
     readOnly: true,
     params: {
-      file: f.string().default(''),
-      file_id: f.string().default(''),
+      file: f.string().default('').role('record'),
+      file_id: f.string().default('').role('file_id'),
+      // Optional server-side transcode (#165): SILK/AMR → the requested
+      // container, returned as `data.base64`. Absent ⇒ behaviour unchanged.
+      out_format: f.enum('mp3', 'amr', 'wma', 'm4a', 'spx', 'ogg', 'wav', 'flac').optional(),
     },
     run: async (p, ctx) => {
       const file = p.file || p.file_id;
       if (!file) return failedResponse(RETCODE.BAD_REQUEST, 'file is required');
       const info = await ctx.getRecordInfo(file);
-      if (info) return okResponse(info);
-      return failedResponse(RETCODE.ACTION_FAILED, 'record not found in cache');
+      if (!info) return failedResponse(RETCODE.ACTION_FAILED, 'record not found in cache');
+      if (!p.out_format) return okResponse(info);
+      // Transcode from the record's download URL (fall back to file field).
+      const source = String(info.url || info.file || '');
+      if (!source) return failedResponse(RETCODE.ACTION_FAILED, 'record has no downloadable source');
+      try {
+        // Keep the original record info (file_size stays the source size, like
+        // NapCat) and just attach the transcoded payload.
+        const { base64 } = await ctx.bridge.apis.extras.convertRecord(source, p.out_format);
+        return okResponse({ ...info, out_format: p.out_format, base64 });
+      } catch (e) {
+        return failedResponse(RETCODE.ACTION_FAILED, `语音转码失败：${e instanceof Error ? e.message : String(e)}`);
+      }
     },
   }),
 
@@ -549,8 +579,16 @@ export const actions = [
     name: ['fetch_ptt_text', 'get_ptt_text', 'get_record_text'],
     summary: '获取语音转文字结果',
     readOnly: true,
+    returns: '{ text }：语音识别出的文本。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        text: { type: 'string', description: '语音转写文本' },
+      },
+      required: ['text'],
+    },
     params: {
-      message_id: f.string().default(''),
+      message_id: f.string().default('').role('message_id'),
     },
     // `raw` so message_id works whether the client sends a number or a string.
     run: async (_p, ctx, raw) => {
@@ -569,6 +607,14 @@ export const actions = [
     name: 'get_cookies',
     summary: '获取 Cookies',
     readOnly: true,
+    returns: '{ cookies }：指定域名的 Cookie 字符串。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        cookies: { type: 'string', description: '该域名的 Cookie 字符串' },
+      },
+      required: ['cookies'],
+    },
     params: { domain: f.string().default('qun.qq.com') },
     run: async (p, ctx) => {
       try {
@@ -584,6 +630,14 @@ export const actions = [
     name: 'get_csrf_token',
     summary: '获取 CSRF 令牌',
     readOnly: true,
+    returns: '{ token }：CSRF 令牌（bkn，数值）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        token: { type: 'integer', description: 'CSRF 令牌（bkn）' },
+      },
+      required: ['token'],
+    },
     params: {},
     run: async (_p, ctx) => {
       try {
@@ -599,6 +653,16 @@ export const actions = [
     name: 'get_credentials',
     summary: '获取凭证',
     readOnly: true,
+    returns: '{ cookies, token, csrf_token }：Cookie 字符串与 CSRF 令牌（token 与 csrf_token 同值）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        cookies: { type: 'string', description: '该域名的 Cookie 字符串' },
+        token: { type: 'integer', description: 'CSRF 令牌（bkn）' },
+        csrf_token: { type: 'integer', description: 'CSRF 令牌（同 token）' },
+      },
+      required: ['cookies', 'token', 'csrf_token'],
+    },
     params: { domain: f.string().default('qun.qq.com') },
     run: async (p, ctx) => {
       try {
@@ -634,7 +698,7 @@ export const actions = [
     name: 'set_friend_remark',
     summary: '设置好友备注',
     params: {
-      user_id: f.uint(),
+      user_id: f.userId(),
       remark: f.string(),
     },
     run: async (p, ctx) => {
@@ -647,7 +711,7 @@ export const actions = [
     name: 'set_group_remark',
     summary: '设置群备注',
     params: {
-      group_id: f.uint(),
+      group_id: f.groupId(),
       remark: f.string(),
     },
     run: async (p, ctx) => {
@@ -686,6 +750,17 @@ export const actions = [
     name: 'get_group_file_system_info',
     summary: '获取群文件系统信息',
     readOnly: true,
+    returns: '{ file_count, limit_count, used_space, total_space }：群文件数量与容量信息（used_space 恒 0，total_space 为固定 10GiB 常量）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        file_count: { type: 'integer', description: '当前文件数' },
+        limit_count: { type: 'integer', description: '最大文件数' },
+        used_space: { type: 'integer', description: '已用空间（占位，恒 0）' },
+        total_space: { type: 'integer', description: '总空间（占位，恒 10GiB）' },
+      },
+      required: ['file_count', 'limit_count', 'used_space', 'total_space'],
+    },
     run: async (p, ctx) => {
       const info = await ctx.bridge.apis.groupFile.getCount(p.group_id);
       return okResponse({
@@ -701,6 +776,14 @@ export const actions = [
     name: 'check_url_safely',
     summary: '检查链接安全性',
     readOnly: true,
+    returns: '{ level }：安全等级（占位实现，恒为 1）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        level: { type: 'integer', description: '安全等级（占位，恒 1）' },
+      },
+      required: ['level'],
+    },
     params: {},
     run: async () => {
       return okResponse({ level: 1 });
@@ -753,7 +836,7 @@ export const actions = [
     name: 'set_diy_online_status',
     summary: '设置自定义在线状态',
     params: {
-      face_id: f.uint(),
+      face_id: f.faceId(),
       // 原实现用 `asNumber(face_type) || 1`，present 0 会被当作缺省 1。
       face_type: f.int({ min: 0 }).default(1),
       wording: f.string().default(''),
@@ -772,6 +855,27 @@ export const actions = [
     name: 'get_group_ignored_notifies',
     summary: '获取被过滤的入群请求',
     readOnly: true,
+    returns: '被过滤的入群请求数组，每项含群号、申请人、邀请人、留言与处理标记。',
+    returnsSchema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          group_id: { type: 'integer', description: '群号' },
+          group_name: { type: 'string', description: '群名称' },
+          request_id: { type: 'integer', description: '请求序列号' },
+          requester_uin: { type: 'integer', description: '申请人 QQ 号' },
+          requester_nick: { type: 'string', description: '申请人昵称' },
+          message: { type: 'string', description: '验证留言' },
+          checked: { type: 'boolean', description: '是否已处理' },
+          actor: { type: 'integer', description: '处理人 QQ 号' },
+          invitor_uin: { type: 'integer', description: '邀请人 QQ 号' },
+          invitor_nick: { type: 'string', description: '邀请人昵称' },
+          flag: { type: 'string', description: '处理用 flag（eventType:groupId:targetUid:filtered）' },
+        },
+        required: ['group_id', 'group_name', 'request_id', 'requester_uin', 'requester_nick', 'message', 'checked', 'actor', 'invitor_uin', 'invitor_nick', 'flag'],
+      },
+    },
     params: {},
     run: async (_p, ctx) => {
       const reqs = await fetchFilteredGroupRequests(ctx);
@@ -798,6 +902,25 @@ export const actions = [
     name: 'get_group_ignore_add_request',
     summary: '获取被忽略的入群请求（NapCat）',
     readOnly: true,
+    returns: '被忽略的入群请求数组（NapCat 字段命名），每项含请求序列、邀请人、群信息与处理标记。',
+    returnsSchema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          request_id: { type: 'integer', description: '请求序列号' },
+          invitor_uin: { type: 'integer', description: '邀请人 QQ 号' },
+          invitor_nick: { type: 'string', description: '邀请人昵称' },
+          group_id: { type: 'integer', description: '群号' },
+          message: { type: 'string', description: '验证留言' },
+          group_name: { type: 'string', description: '群名称' },
+          checked: { type: 'boolean', description: '是否已处理' },
+          actor: { type: 'integer', description: '处理人 QQ 号' },
+          requester_nick: { type: 'string', description: '申请人昵称' },
+        },
+        required: ['request_id', 'invitor_uin', 'invitor_nick', 'group_id', 'message', 'group_name', 'checked', 'actor', 'requester_nick'],
+      },
+    },
     params: {},
     run: async (_p, ctx) => {
       const reqs = await fetchFilteredGroupRequests(ctx);
@@ -825,6 +948,19 @@ export const actions = [
     name: 'get_group_shut_list',
     summary: '获取群禁言列表',
     readOnly: true,
+    returns: '仍在禁言中的成员数组，每项含 QQ 号、昵称与禁言到期时间戳（秒）。',
+    returnsSchema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          user_id: { type: 'integer', description: '成员 QQ 号' },
+          nickname: { type: 'string', description: '成员昵称' },
+          shut_up_time: { type: 'integer', description: '禁言到期时间戳（秒）' },
+        },
+        required: ['user_id', 'nickname', 'shut_up_time'],
+      },
+    },
     run: async (p, ctx) => {
       const members = await ctx.bridge.apis.contacts.fetchGroupMemberList(p.group_id);
       const nowSec = Math.floor(Date.now() / 1000);
@@ -857,7 +993,7 @@ export const actions = [
     summary: '转发单条消息给好友',
     params: {
       message_id: f.messageId(),
-      user_id: f.uint(),
+      user_id: f.userId(),
     },
     run: async (p, ctx) => {
       try {
@@ -874,7 +1010,7 @@ export const actions = [
     summary: '转发单条消息到群',
     params: {
       message_id: f.messageId(),
-      group_id: f.uint(),
+      group_id: f.groupId(),
     },
     run: async (p, ctx) => {
       try {
@@ -890,9 +1026,39 @@ export const actions = [
     name: 'get_profile_like',
     summary: '获取资料点赞',
     readOnly: true,
+    returns: '点赞资料：uid、最近点赞时间、收藏（favoriteInfo）与点赞（voteInfo）统计。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        uid: { type: 'string', description: '用户 uid' },
+        time: { type: 'integer', description: '最近点赞时间戳' },
+        favoriteInfo: {
+          type: 'object',
+          description: '收藏统计',
+          properties: {
+            total_count: { type: 'integer', description: '收藏总数' },
+            last_time: { type: 'integer', description: '最近收藏时间戳' },
+            today_count: { type: 'integer', description: '今日收藏数' },
+            userInfos: { type: 'array', description: '用户列表（恒空）' },
+          },
+        },
+        voteInfo: {
+          type: 'object',
+          description: '点赞统计',
+          properties: {
+            total_count: { type: 'integer', description: '点赞总数' },
+            new_count: { type: 'integer', description: '新增点赞数' },
+            new_nearby_count: { type: 'integer', description: '附近的人新增点赞数' },
+            last_visit_time: { type: 'integer', description: '最近访问时间戳' },
+            userInfos: { type: 'array', description: '用户列表（恒空）' },
+          },
+        },
+      },
+      required: ['uid', 'time', 'favoriteInfo', 'voteInfo'],
+    },
     params: {
       // 原实现 user_id 经 asNumber，无校验（0 也透传）。
-      user_id: f.int({ min: 0 }).default(0),
+      user_id: f.int({ min: 0 }).default(0).role('user_id'),
       start: f.int({ min: 0 }).default(0),
       count: f.int({ min: 0 }).default(10),
     },
@@ -910,6 +1076,11 @@ export const actions = [
     name: 'fetch_custom_face',
     summary: '获取自定义表情',
     readOnly: true,
+    returns: '字符串数组：return_type=url 时为图片 URL，return_type=id 时为 emoji_id。',
+    returnsSchema: {
+      type: 'array',
+      items: { type: 'string', description: '图片 URL 或 emoji_id（取决于 return_type）' },
+    },
     params: {
       count: f.int({ min: 0 }).default(10),
       // return_type=url 返回图片 URL（默认，给前端显示）；
@@ -937,6 +1108,25 @@ export const actions = [
     name: 'get_emoji_likes',
     summary: '获取表情回应用户',
     readOnly: true,
+    returns: '{ emoji_like_list }：回应该表情的用户列表（nick_name 恒为空串）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        emoji_like_list: {
+          type: 'array',
+          description: '回应用户列表',
+          items: {
+            type: 'object',
+            properties: {
+              user_id: { type: 'string', description: '用户 QQ 号（字符串）' },
+              nick_name: { type: 'string', description: '昵称（当前实现恒为空串）' },
+            },
+            required: ['user_id', 'nick_name'],
+          },
+        },
+      },
+      required: ['emoji_like_list'],
+    },
     params: {
       message_id: f.messageId(),
       emoji_id: f.string({ allowEmpty: false }),
@@ -957,6 +1147,31 @@ export const actions = [
     name: 'fetch_emoji_like',
     summary: '获取表情回应用户（NapCat 分页）',
     readOnly: true,
+    returns: '分页的表情回应用户列表（NapCat 形状），含分页游标 cookie 与首/末页标记。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        result: { type: 'integer', description: '结果码（恒 0）' },
+        errMsg: { type: 'string', description: '错误信息（恒空串）' },
+        emojiLikesList: {
+          type: 'array',
+          description: '回应用户列表',
+          items: {
+            type: 'object',
+            properties: {
+              tinyId: { type: 'string', description: '用户 QQ 号（字符串）' },
+              nickName: { type: 'string', description: '昵称（恒空串）' },
+              headUrl: { type: 'string', description: '头像 URL（恒空串）' },
+            },
+            required: ['tinyId', 'nickName', 'headUrl'],
+          },
+        },
+        cookie: { type: 'string', description: '下一页游标（末页为空串）' },
+        isLastPage: { type: 'boolean', description: '是否末页' },
+        isFirstPage: { type: 'boolean', description: '是否首页' },
+      },
+      required: ['result', 'errMsg', 'emojiLikesList', 'cookie', 'isLastPage', 'isFirstPage'],
+    },
     params: {
       message_id: f.messageId(),
       emojiId: f.string({ allowEmpty: false }),
@@ -1005,6 +1220,8 @@ export const actions = [
     name: 'get_recent_contact',
     summary: '获取最近会话（占位）',
     readOnly: true,
+    returns: '占位实现，恒返回空数组。',
+    returnsSchema: { type: 'array', description: '最近会话列表（占位，恒空）' },
     params: {
       count: f.int({ min: 0 }).default(10),
     },
@@ -1021,6 +1238,14 @@ export const actions = [
     name: 'get_online_clients',
     summary: '获取在线客户端（占位，OneBot v11 形状）',
     readOnly: true,
+    returns: '{ clients }：在线设备列表（占位，clients 恒为空数组）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        clients: { type: 'array', description: '在线设备列表（占位，恒空）' },
+      },
+      required: ['clients'],
+    },
     params: {},
     run: async () => {
       return okResponse({ clients: [] });
@@ -1036,6 +1261,24 @@ export const actions = [
     name: '_get_model_show',
     summary: '获取机型展示（兼容 mock）',
     readOnly: true,
+    returns: '数组，每项含 variants（回显请求的机型名与 need_pay 标记）。',
+    returnsSchema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          variants: {
+            type: 'object',
+            properties: {
+              model_show: { type: 'string', description: '机型展示名（回显请求的 model，缺省 snowluma）' },
+              need_pay: { type: 'boolean', description: '是否需付费（恒 false）' },
+            },
+            required: ['model_show', 'need_pay'],
+          },
+        },
+        required: ['variants'],
+      },
+    },
     params: {
       model: f.string().default(''),
     },
@@ -1058,6 +1301,16 @@ export const actions = [
     name: 'get_group_at_all_remain',
     summary: '获取群 @全体成员 剩余次数',
     readOnly: true,
+    returns: '{ can_at_all, remain_at_all_count_for_group, remain_at_all_count_for_uin }：@全体可用性与剩余次数。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        can_at_all: { type: 'boolean', description: '当前是否可 @全体成员' },
+        remain_at_all_count_for_group: { type: 'integer', description: '本群今日剩余 @全体次数' },
+        remain_at_all_count_for_uin: { type: 'integer', description: '本账号今日剩余 @全体次数' },
+      },
+      required: ['can_at_all', 'remain_at_all_count_for_group', 'remain_at_all_count_for_uin'],
+    },
     run: async (p, ctx) => {
       try {
         const data = await ctx.bridge.apis.groupAdmin.getAtAllRemain(p.group_id);
@@ -1087,6 +1340,16 @@ export const actions = [
     name: 'get_clientkey',
     summary: '获取 clientkey',
     readOnly: true,
+    returns: '{ clientKey, expireTime, keyIndex }：clientkey 及其过期时间与索引。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        clientKey: { type: 'string', description: 'clientkey' },
+        expireTime: { type: 'string', description: '过期时间' },
+        keyIndex: { type: 'string', description: 'key 索引' },
+      },
+      required: ['clientKey', 'expireTime', 'keyIndex'],
+    },
     params: {},
     run: async (_p, ctx) => {
       const clientKeyInfo = await ctx.bridge.apis.web.forceFetchClientKey();
@@ -1109,9 +1372,17 @@ export const actions = [
     name: 'share_peer',
     summary: '分享用户/群 Ark 卡片',
     readOnly: true,
+    returns: '{ arkMsg }：服务端生成的推荐联系人 Ark 卡片 JSON 字符串。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        arkMsg: { type: 'string', description: 'Ark 卡片 JSON 字符串' },
+      },
+      required: ['arkMsg'],
+    },
     params: {
-      user_id: f.uint().optional(),
-      group_id: f.uint().optional(),
+      user_id: f.userId().optional(),
+      group_id: f.groupId().optional(),
       phone_number: f.string().default(''),
     },
     run: async (p, ctx) => {
@@ -1132,9 +1403,17 @@ export const actions = [
     name: 'send_ark_share',
     summary: '分享用户/群 Ark 卡片（NapCat 标准名）',
     readOnly: true,
+    returns: '{ arkMsg }：服务端生成的推荐联系人 Ark 卡片 JSON 字符串。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        arkMsg: { type: 'string', description: 'Ark 卡片 JSON 字符串' },
+      },
+      required: ['arkMsg'],
+    },
     params: {
-      user_id: f.uint().optional(),
-      group_id: f.uint().optional(),
+      user_id: f.userId().optional(),
+      group_id: f.groupId().optional(),
       phone_number: f.string().default(''),
     },
     run: async (p, ctx) => {
@@ -1160,7 +1439,9 @@ export const actions = [
     name: 'share_group_ex',
     summary: '分享群 Ark 卡片',
     readOnly: true,
-    params: { group_id: f.uint() },
+    returns: '服务端生成的群推荐 Ark 卡片 JSON 字符串。',
+    returnsSchema: { type: 'string', description: '群 Ark 卡片 JSON 字符串' },
+    params: { group_id: f.groupId() },
     run: async (p, ctx) => {
       try {
         return okResponse(await ctx.bridge.apis.contacts.getGroupRecommendArk(p.group_id));
@@ -1173,7 +1454,9 @@ export const actions = [
     name: 'send_group_ark_share',
     summary: '分享群 Ark 卡片（NapCat 标准名）',
     readOnly: true,
-    params: { group_id: f.uint() },
+    returns: '服务端生成的群推荐 Ark 卡片 JSON 字符串。',
+    returnsSchema: { type: 'string', description: '群 Ark 卡片 JSON 字符串' },
+    params: { group_id: f.groupId() },
     run: async (p, ctx) => {
       try {
         return okResponse(await ctx.bridge.apis.contacts.getGroupRecommendArk(p.group_id));
@@ -1189,6 +1472,21 @@ export const actions = [
     name: 'get_doubt_friends_add_request',
     summary: '获取可疑好友申请',
     readOnly: true,
+    returns: '可疑好友申请数组，每项含 uid（作为处理用 flag）、昵称、来源、留言与申请时间。',
+    returnsSchema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          uid: { type: 'string', description: '申请人 uid（回传作 set_doubt_friends_add_request 的 flag）' },
+          nick: { type: 'string', description: '申请人昵称' },
+          source: { type: 'string', description: '申请来源' },
+          msg: { type: 'string', description: '验证留言' },
+          reqTime: { type: 'integer', description: '申请时间戳' },
+        },
+        required: ['uid', 'nick', 'source', 'msg', 'reqTime'],
+      },
+    },
     params: { count: f.int({ min: 0 }).default(50) },
     run: async (p, ctx) => {
       try {
@@ -1251,6 +1549,8 @@ export const actions = [
     name: 'get_collection_list',
     summary: '获取收藏列表（占位）',
     readOnly: true,
+    returns: '占位实现，恒返回空数组。',
+    returnsSchema: { type: 'array', description: '收藏列表（占位，恒空）' },
     params: {},
     run: async () => {
       return okResponse([]);
@@ -1279,7 +1579,7 @@ export const actions = [
   defineAction({
     name: 'set_qq_avatar',
     summary: '设置 QQ 头像',
-    params: { file: f.string({ allowEmpty: false }) },
+    params: { file: f.image() },
     run: async (p, ctx) => {
       try {
         await ctx.bridge.apis.profile.setAvatar(p.file);
@@ -1294,7 +1594,7 @@ export const actions = [
     name: 'set_input_status',
     summary: '设置输入状态',
     params: {
-      user_id: f.uint(),
+      user_id: f.userId(),
       // event_type 可能为 0（取消输入状态）；缺省也按 0 处理（与旧 asNumber 行为一致）。
       event_type: f.int().default(0),
     },
@@ -1312,7 +1612,7 @@ export const actions = [
     name: 'get_group_info_ex',
     summary: '获取群信息（扩展）',
     readOnly: true,
-    params: { group_id: f.uint() },
+    params: { group_id: f.groupId() },
     run: async (p, ctx) => {
       if (ctx.getGroupInfo) {
         return okResponse(await ctx.getGroupInfo(p.group_id));
@@ -1325,7 +1625,7 @@ export const actions = [
     name: 'get_group_detail_info',
     summary: '获取群详细信息',
     readOnly: true,
-    params: { group_id: f.uint() },
+    params: { group_id: f.groupId() },
     run: async (p, ctx) => {
       if (ctx.getGroupInfo) {
         return okResponse(await ctx.getGroupInfo(p.group_id));
@@ -1358,8 +1658,8 @@ export const actions = [
     summary: '获取文件信息（仅图片/语音缓存；群文件请用 get_group_file_url）',
     readOnly: true,
     params: {
-      file_id: f.string().default(''),
-      file: f.string().default(''),
+      file_id: f.string().default('').role('file_id'),
+      file: f.string().default('').role('file'),
     },
     run: async (p, ctx) => {
       const fileId = p.file || p.file_id;
@@ -1391,6 +1691,8 @@ export const actions = [
     name: 'nc_get_packet_status',
     summary: '获取 packet 状态（占位）',
     readOnly: true,
+    returns: '占位实现，恒返回 null。',
+    returnsSchema: { type: 'null', description: 'packet 状态（占位，恒 null）' },
     params: {},
     run: async () => {
       return okResponse(null);
@@ -1415,7 +1717,16 @@ export const actions = [
     name: 'nc_get_user_status',
     summary: '获取用户在线/扩展状态',
     readOnly: true,
-    params: { user_id: f.uint() },
+    returns: '{ status, ext_status }：用户在线状态码与扩展状态码。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        status: { type: 'integer', description: '在线状态码' },
+        ext_status: { type: 'integer', description: '扩展状态码' },
+      },
+      required: ['status', 'ext_status'],
+    },
+    params: { user_id: f.userId() },
     run: async (p, ctx) => {
       const status = await ctx.bridge.apis.extras.getStrangerStatus(p.user_id);
       if (!status) return failedResponse(RETCODE.ACTION_FAILED, 'failed to fetch user status');
@@ -1428,6 +1739,30 @@ export const actions = [
     name: 'get_ai_characters',
     summary: '获取 AI 语音角色',
     readOnly: true,
+    returns: '按分类分组的 AI 语音角色列表，每组含分类名与角色（id、名称、试听 URL）。',
+    returnsSchema: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          type: { type: 'string', description: '角色分类名' },
+          characters: {
+            type: 'array',
+            description: '该分类下的角色列表',
+            items: {
+              type: 'object',
+              properties: {
+                character_id: { type: 'string', description: '角色 ID' },
+                character_name: { type: 'string', description: '角色显示名' },
+                preview_url: { type: 'string', description: '试听音频 URL' },
+              },
+              required: ['character_id', 'character_name', 'preview_url'],
+            },
+          },
+        },
+        required: ['type', 'characters'],
+      },
+    },
     params: { chat_type: f.int({ min: 0 }).default(1) },
     run: async (p, ctx) => {
       try {
@@ -1535,6 +1870,17 @@ export const actions = [
     name: 'get_rkey_server',
     summary: '获取 rkey 服务器信息',
     readOnly: true,
+    returns: '{ expired_time, name, private_rkey?, group_rkey? }：rkey 过期时间与（存在时的）私聊/群聊 rkey。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        expired_time: { type: 'integer', description: '过期时间戳（秒）' },
+        name: { type: 'string', description: '服务器名（恒 SnowLuma）' },
+        private_rkey: { type: 'string', description: '私聊 rkey（存在时返回）' },
+        group_rkey: { type: 'string', description: '群聊 rkey（存在时返回）' },
+      },
+      required: ['expired_time', 'name'],
+    },
     params: {},
     run: async (_p, ctx) => {
       if (!ctx.getDownloadRKeys) return failedResponse(RETCODE.ACTION_FAILED, 'not implemented');
@@ -1570,7 +1916,39 @@ export const actions = [
     name: ['ocr_image', '.ocr_image'],
     summary: 'OCR 图片（服务端，需图片 URL 或已缓存的图片 file_id）',
     readOnly: true,
-    params: { image: f.string({ allowEmpty: false }) },
+    returns: '{ texts, language }：识别文本数组（含置信度与坐标）与识别语言。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        texts: {
+          type: 'array',
+          description: '识别出的文本块',
+          items: {
+            type: 'object',
+            properties: {
+              text: { type: 'string', description: '文本内容' },
+              confidence: { type: 'number', description: '置信度' },
+              coordinates: {
+                type: 'array',
+                description: '文本框顶点坐标',
+                items: {
+                  type: 'object',
+                  properties: {
+                    x: { type: 'number', description: 'X 坐标' },
+                    y: { type: 'number', description: 'Y 坐标' },
+                  },
+                  required: ['x', 'y'],
+                },
+              },
+            },
+            required: ['text', 'confidence', 'coordinates'],
+          },
+        },
+        language: { type: 'string', description: '识别语言' },
+      },
+      required: ['texts', 'language'],
+    },
+    params: { image: f.image() },
     run: async (p, ctx) => {
       // A passed-in http(s) URL is used verbatim (NOT re-signed) — if it is a
       // stale CDN URL with an expired rkey the server fetch fails and surfaces
@@ -1658,7 +2036,7 @@ export const actions = [
     name: 'send_private_forward_msg',
     summary: '发送私聊合并转发',
     returns: '{ message_id, res_id, forward_id }',
-    params: { user_id: f.uint(), messages: f.message().optional(), message: f.message().optional() },
+    params: { user_id: f.userId(), messages: f.message().optional(), message: f.message().optional() },
     run: async (p, ctx, raw) => {
       const messages = p.messages ?? p.message;
       if (messages === undefined) return failedResponse(RETCODE.BAD_REQUEST, 'message/messages is required');
@@ -1671,7 +2049,14 @@ export const actions = [
     name: 'get_forward_msg',
     summary: '获取合并转发消息（id 或 message_id）',
     readOnly: true,
-    returns: '{ messages }',
+    returns: '{ messages }：转发内的消息节点数组（每项为 OneBot 消息事件，内部字段不固定）。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        messages: { type: 'array', description: '转发消息节点数组', items: { type: 'object' } },
+      },
+      required: ['messages'],
+    },
     params: { id: f.string().optional() },
     run: async (p, ctx, raw) => {
       let id = p.id || '';
@@ -1736,7 +2121,14 @@ export const actions = [
     name: 'translate_en2zh',
     summary: '英译中',
     readOnly: true,
-    returns: '{ words }',
+    returns: '{ words }：与输入等长的中文译文字符串数组。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        words: { type: 'array', description: '译文数组', items: { type: 'string' } },
+      },
+      required: ['words'],
+    },
     params: { words: f.raw() },
     run: async (p, ctx) => {
       const rawWords = p.words;
@@ -2029,8 +2421,8 @@ export const actions = [
     returns: '{ message_id }',
     params: {
       fileset_id: f.string({ allowEmpty: false }),
-      user_id: f.uint().optional(),
-      group_id: f.uint().optional(),
+      user_id: f.userId().optional(),
+      group_id: f.groupId().optional(),
     },
     run: async (p, ctx) => {
       if (!p.user_id && !p.group_id) {
@@ -2053,7 +2445,14 @@ export const actions = [
     name: 'get_fileset_id',
     summary: '从分享码/链接获取 fileset_id',
     readOnly: true,
-    returns: '{ fileset_id }',
+    returns: '{ fileset_id }：解析出的文件集 ID。',
+    returnsSchema: {
+      type: 'object',
+      properties: {
+        fileset_id: { type: 'string', description: '文件集 ID' },
+      },
+      required: ['fileset_id'],
+    },
     params: { share_code: f.string({ allowEmpty: false }) },
     run: async (p, ctx) => {
       try {

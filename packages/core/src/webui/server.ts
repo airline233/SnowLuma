@@ -3,6 +3,7 @@ import { serveStatic } from '@hono/node-server/serve-static';
 import type { HookManager, HookProcessInfo } from '@snowluma/bridge';
 import { createLogger, getLogLevel, getRecentLogs, LOG_LEVELS, setLogLevel, subscribeLogs } from '@snowluma/common/logger';
 import { loadOneBotConfig, saveOneBotConfig } from '@snowluma/onebot/config';
+import { loadGlobalSettings, saveGlobalSettings } from '@snowluma/onebot/global-config';
 import type { OneBotManager } from '@snowluma/onebot/manager';
 import type { OneBotConfig, JsonObject as OneBotJsonObject } from '@snowluma/onebot/types';
 import { readRuntimeConfig, updateRuntimeConfig, resolveRuntimeEnvOverrides } from '@snowluma/common/runtime';
@@ -21,6 +22,10 @@ import { coerceSettingsPatch } from './system-settings';
 import { buildBackup, planRestore, validateBackup } from './backup';
 import { collectActionDocs, collectCategories } from '@snowluma/onebot/action-docs';
 import { createFramePusher } from './debug-stream';
+import { buildStreamInvokeResponse, streamUploadToDisk } from './debug-tools';
+import { bindStateStream } from './state-stream';
+import type { StateBus, StateResource } from './state-bus';
+import { startConnectionDiffLoop } from './connection-diff-loop';
 import { describeTrustProxy, makeClientIpResolver, parseTrustProxy } from './client-ip';
 import { findAvailablePort } from './port';
 import {
@@ -80,14 +85,20 @@ const CONSENT_ALLOWLIST = new Set([
   '/api/logout',
 ]);
 
-// Endpoints that may authenticate via `?token=` query parameter. Only the
-// SSE log stream is here because EventSource cannot set custom headers; all
-// other endpoints MUST use the Authorization header so tokens never leak
-// into access logs / Referer / browser history.
-const TOKEN_QUERY_ALLOWLIST = new Set([
+// Endpoints that may authenticate via `?token=` query parameter. Reserved
+// for SSE streams: EventSource cannot set custom headers, so these MUST
+// accept the token via query. All other endpoints use the Authorization
+// header so tokens never leak into access logs / Referer / browser history.
+//
+// Exported so the regression test can lock the invariant — a missing entry
+// here silently 401s the EventSource and the whole push channel goes dark,
+// which has happened (see /api/state/stream's first cut).
+export const SSE_TOKEN_QUERY_PATHS: ReadonlySet<string> = new Set([
   '/api/logs/stream',
   '/api/debug/stream',
+  '/api/state/stream',
 ]);
+const TOKEN_QUERY_ALLOWLIST = SSE_TOKEN_QUERY_PATHS;
 
 // uin = QQ number; 5–12 digits. Used to construct config file paths,
 // so we MUST refuse anything else (path traversal, NUL bytes, etc.).
@@ -313,7 +324,7 @@ export async function initWebUI(
   oneBotManager: OneBotManager,
   hookManager?: HookManager,
   notificationManager?: NotificationManager,
-  listener: { host?: string; tlsEnabled?: boolean; trustProxy?: string } = {},
+  listener: { host?: string; tlsEnabled?: boolean; trustProxy?: string; stateBus?: StateBus } = {},
 ): Promise<{ port: number }> {
   // Resolve the client IP for per-IP rate limiting from the configured
   // trust-proxy directive (runtime.json `trustProxy`, env-overridable via
@@ -321,6 +332,54 @@ export async function initWebUI(
   // Default ('') = trust the TCP socket peer only (cannot be spoofed).
   const trustProxyMode = parseTrustProxy(listener.trustProxy);
   const getClientIp = makeClientIpResolver(trustProxyMode);
+
+  // Connection-status diff loop: OneBot adapters don't emit events for
+  // listening/connected/client-count changes, so we poll the snapshot at
+  // 500ms and publish 'connections' to the StateBus when it actually
+  // moves. One loop per server lifetime, lives until process exit (the
+  // setInterval is .unref'd inside the loop so it doesn't pin the event
+  // loop on shutdown).
+  //
+  // `pickComparable` strips `adapter.detail` — that's a localised human
+  // string assembled with HH:MM:SS timestamps from the last webhook
+  // delivery; including it in the diff would make every webhook event
+  // produce a publish (defeating the diff). We compare ONLY name + kind +
+  // status, which captures every transition the dashboard actually
+  // renders differently. The SSE handler still ships the FULL snapshot
+  // (with `detail`) — it's only the diff key that's pruned.
+  //
+  // Trade-off: the rendered detail string (e.g. "3 个客户端", "上次推送
+  // 14:53:01") only refreshes on the next SSE push or on the 30s REST
+  // reconcile — not in real time. The user's original reported bugs were
+  // about process / account edges (which DO push instantly); refreshing
+  // adapter detail strings at sub-second cadence wasn't required. If it
+  // becomes one, surface client-count as a structured field on
+  // AdapterStatus and include it in the comparable.
+  if (listener.stateBus) {
+    // Handle deliberately discarded — initWebUI has no shutdown path; the
+    // loop's setInterval is .unref'd so it doesn't pin the event loop.
+    startConnectionDiffLoop({
+      bus: listener.stateBus,
+      getSnapshot: () => oneBotManager.getConnectionStatuses(),
+      pickComparable: (snap) => {
+        if (!Array.isArray(snap)) return snap;
+        return (snap as Array<{ uin: string; nickname?: string; adapters?: unknown[] }>).map((acc) => ({
+          uin: acc.uin,
+          nickname: acc.nickname,
+          // Empty fallback when `adapters` is not an array — never the
+          // raw value, which could re-introduce volatile fields verbatim
+          // if the snapshot shape ever drifts.
+          adapters: Array.isArray(acc.adapters)
+            ? acc.adapters.map((a: unknown) => {
+                const o = a as { name?: string; kind?: string; status?: string };
+                return { name: o.name, kind: o.kind, status: o.status };
+              })
+            : [],
+        }));
+      },
+      intervalMs: 500,
+    });
+  }
 
   // Actual bound port (set just before serve; findAvailablePort may bump it).
   // Read by GET /api/system/settings so the panel shows what's really live.
@@ -871,6 +930,42 @@ export async function initWebUI(
     return c.json(result);
   });
 
+  // Invoke a Stream API action (or any action) and relay every frame to the
+  // browser over an SSE body. The frontend reads this with fetch()+a stream
+  // reader (Bearer auth in the header), so — unlike /api/debug/stream — it does
+  // NOT need a query-token allowlist entry. Frames are never dropped.
+  app.post('/api/debug/invoke-stream', async (c) => {
+    let body: unknown;
+    try { body = await c.req.json(); } catch { return c.json({ status: 'failed', message: '请求格式错误' }, 400); }
+    const { uin, action, params } = (body ?? {}) as { uin?: unknown; action?: unknown; params?: unknown };
+    if (typeof uin !== 'string' || !UIN_REGEX.test(uin)) return c.json({ status: 'failed', message: '无效的账号' }, 400);
+    if (typeof action !== 'string' || !action) return c.json({ status: 'failed', message: 'action 必填' }, 400);
+    if (params !== undefined && (typeof params !== 'object' || params === null || Array.isArray(params))) {
+      return c.json({ status: 'failed', message: 'params 必须是对象' }, 400);
+    }
+    const inst = oneBotManager.getInstance(uin);
+    if (!inst) return c.json({ status: 'failed', message: '账号不在线' }, 404);
+    const rawRequest = JSON.stringify({ action, params: params ?? {} });
+    return buildStreamInvokeResponse(
+      (rq, emit, alive) => inst.invokeStream(rq, emit, alive),
+      rawRequest,
+      c.req.raw.signal,
+    );
+  });
+
+  // Stream a browser-selected file to a temp path on THIS server (the bot runs
+  // here, not on the operator's machine), so the returned path can be fed to a
+  // send action's file/image/record/video param. Raw bytes in the body,
+  // `?filename=` for a human-readable suffix; streamed to disk with a byte cap.
+  app.post('/api/debug/upload', async (c) => {
+    try {
+      const result = await streamUploadToDisk(c.req.raw.body as ReadableStream<Uint8Array> | null, c.req.query('filename'));
+      return c.json({ status: 'ok', path: result.path, size: result.size });
+    } catch (err) {
+      return c.json({ status: 'failed', message: err instanceof Error ? err.message : '上传失败' }, 400);
+    }
+  });
+
   // Live merged SSE of OneBot events + action calls across all accounts. Taps
   // are attached only while a client is connected (on-demand). A slow client is
   // dropped (not back-pressured onto the bot) with a periodic drop marker.
@@ -924,6 +1019,77 @@ export async function initWebUI(
   // counts / last-delivery), powering the dashboard's connection card.
   app.get('/api/connections', (c) => {
     return c.json({ list: oneBotManager.getConnectionStatuses() });
+  });
+
+  // Combined SSE feed for the dashboard's three live resources — processes,
+  // qq-list, connections. Replaces the 3s REST polling tick in
+  // app-layout.tsx; the REST endpoints above stay for the initial fetch
+  // before SSE connects and for the slow (30s) reconciliation fallback.
+  //
+  // On connect: one frame per resource with the current snapshot. After
+  // that: a fresh snapshot per resource only when the StateBus signals a
+  // change (HookSession status-changed, BridgeManager session edges, the
+  // connection-status diff loop). 50ms per-resource debounce coalesces a
+  // burst (e.g. multiple HookSessions flipping status simultaneously).
+  const stateBus = listener.stateBus;
+  app.get('/api/state/stream', (c) => {
+    if (!stateBus) {
+      // Build without state-wiring (e.g. a future headless mode) — clients
+      // fall back to the REST endpoints. Treat as endpoint-not-here.
+      return c.text('state stream not configured', 503);
+    }
+    const liveBus = stateBus;
+    const stream = new ReadableStream({
+      start(controller) {
+        const encoder = new TextEncoder();
+        let closed = false;
+        let binding: { dispose(): void } | undefined;
+        let heartbeat: NodeJS.Timeout | undefined;
+        const teardown = () => {
+          if (closed) return;
+          closed = true;
+          if (heartbeat) clearInterval(heartbeat);
+          binding?.dispose();
+          try { controller.close(); } catch { /* ignore */ }
+        };
+        const raw = (chunk: Uint8Array) => {
+          if (closed) return;
+          try { controller.enqueue(chunk); } catch { teardown(); }
+        };
+        const pushFrame = createFramePusher({
+          desiredSize: () => controller.desiredSize,
+          enqueue: raw,
+          encode: (s) => encoder.encode(s),
+        });
+        const send = (payload: unknown) => { if (!closed) pushFrame(payload); };
+        send({ kind: 'ready' });
+
+        const handle = bindStateStream({
+          bus: liveBus,
+          snapshot: async (resource: StateResource): Promise<unknown> => {
+            if (resource === 'processes') {
+              if (!hookManager) return [];
+              return hookManager.listProcesses();
+            }
+            if (resource === 'qq-list') {
+              return oneBotManager.getInstances().map((inst) => ({ uin: inst.uin, nickname: inst.nickname }));
+            }
+            return oneBotManager.getConnectionStatuses();
+          },
+          send: (frame) => send(frame),
+          debounceMs: 50,
+        });
+        binding = handle;
+        // Prime with the initial snapshot; if the client never sees the
+        // bus publish (idle system) it still has the current state.
+        void handle.sendAllInitial();
+        heartbeat = setInterval(() => raw(encoder.encode(': heartbeat\n\n')), 15000);
+        c.req.raw.signal.addEventListener('abort', teardown);
+      },
+    });
+    return new Response(stream, {
+      headers: { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' },
+    });
   });
 
   app.get('/api/logs', (c) => {
@@ -1117,6 +1283,32 @@ export async function initWebUI(
         ? '测试发送成功'
         : `测试发送失败：${result.error ?? (result.status ? `HTTP ${result.status}` : '未知错误')}`,
     });
+  });
+
+  // ─── Global deployment config (config/snowluma.json) ─────────────────────
+  // All-accounts SnowLuma knobs (rkey fallback servers + musicSignUrl). Saving
+  // section-merges + normalizes server-side, then hot-reloads every instance.
+  app.get('/api/global-config', (c) => c.json({ config: loadGlobalSettings() }));
+
+  app.post('/api/global-config', async (c) => {
+    const declaredLen = Number(c.req.header('content-length'));
+    if (Number.isFinite(declaredLen) && declaredLen > 512 * 1024) {
+      return c.json({ success: false, message: '配置过大' }, 413);
+    }
+    let body: unknown;
+    try {
+      body = await c.req.json();
+    } catch {
+      return c.json({ success: false, message: '请求格式错误' }, 400);
+    }
+    try {
+      const config = saveGlobalSettings(body);
+      oneBotManager.reloadGlobalSettings();
+      return c.json({ success: true, config });
+    } catch (err) {
+      log.warn('save global config failed: %s', err instanceof Error ? err.message : String(err));
+      return c.json({ success: false, message: '保存失败，请检查服务器日志' }, 500);
+    }
   });
 
   // ─── WebUI customization config (config/ui.json) ─────────────────────────

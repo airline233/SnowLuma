@@ -2,8 +2,10 @@ import { HookManager } from '@snowluma/bridge';
 import { closeLogger, createLogger } from '@snowluma/common/logger';
 import { loadRuntimeConfig } from '@snowluma/common/runtime';
 import { OneBotManager } from '@snowluma/onebot/manager';
+import { migrateGlobalSettings } from '@snowluma/onebot/global-config';
 import { BridgeManager } from './bridge/manager';
 import { createNotificationManager } from './notifications/manager';
+import { createStateWiring } from './webui/state-wiring';
 
 const runtimeConfig = loadRuntimeConfig();
 const log = createLogger('App');
@@ -27,15 +29,29 @@ process.on('uncaughtException', (error) => {
 async function main() {
   log.info('SnowLuma starting');
 
+  // One-shot: lift a legacy per-UIN musicSignUrl into the global store before
+  // any session (and thus any per-UIN config rewrite) can drop it.
+  migrateGlobalSettings();
+
   const bridgeManager = new BridgeManager();
   const oneBotManager = new OneBotManager();
   const autoLoadOnDiscovery = resolveAutoLoad(runtimeConfig.hookAutoLoad);
-  const hookManager = new HookManager({ bridgeManager, autoLoadOnDiscovery });
+
+  // WebUI state-push wiring: HookManager + BridgeManager edges publish
+  // `processes` / `qq-list` / `connections` invalidations into a bus the
+  // /api/state/stream SSE handler subscribes to (no REST polling required).
+  const stateWiring = createStateWiring();
+  const hookManager = new HookManager({
+    bridgeManager,
+    autoLoadOnDiscovery,
+    onSessionsChanged: stateWiring.onSessionsChanged,
+  });
   if (autoLoadOnDiscovery) {
     log.info('hook auto-load enabled: every discovered QQ process will be injected');
   }
 
   oneBotManager.bind(bridgeManager);
+  stateWiring.bindBridgeManager(bridgeManager);
 
   // Global notification subsystem (account up/down → webhook). Bound AFTER
   // OneBotManager so the nickname fallback is already populated when it observes.
@@ -52,6 +68,7 @@ async function main() {
         host: runtimeConfig.webuiHost,
         tlsEnabled: runtimeConfig.webuiTls?.enabled,
         trustProxy: runtimeConfig.trustProxy,
+        stateBus: stateWiring.bus,
       });
     } catch (err) {
       log.error('Failed to start WebUI: ', err);
@@ -65,6 +82,7 @@ async function main() {
     oneBotManager.dispose();
     notificationManager.dispose();
     hookManager.dispose();
+    stateWiring.dispose();
     await closeLogger();
     process.exit(0);
   };

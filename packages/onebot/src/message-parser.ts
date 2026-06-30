@@ -9,6 +9,7 @@ export interface ParseMessageOptions {
   resolveReplySequence?: (replyMessageId: number) => number | null;
   resolveReplyMeta?: (replyMessageId: number) => { senderUin: number; time: number; random: number } | null;
   resolveMentionUid?: (targetUin: number) => string | null | Promise<string | null>;
+  resolveContactArk?: (contactType: string, contactId: number) => string | null | Promise<string | null>;
   musicSignUrl?: string;
 }
 
@@ -51,6 +52,32 @@ export function parseCQParams(raw: string): Record<string, string> {
     }
   }
   return params;
+}
+
+/**
+ * Pick the best loadable source from a media segment's `file` / `url` / `path`
+ * / `media` fields.
+ *
+ * `file` is normally the canonical OneBot field and wins, but it can also be a
+ * QQ-internal media id (e.g. `<md5>.png`) that this process cannot resolve to a
+ * local path. When a bot framework echoes a received image back (Yunzai et al.
+ * resend the original `file=<md5>.ext` together with the download `url`), using
+ * `file` makes the send path `statSync` the id as a bogus local path and throw
+ * `ENOENT`. So: keep `file` when it is a directly loadable source (inline
+ * bytes, a remote url, or a filesystem path with a separator); otherwise, if a
+ * real http(s) `url` accompanies it, prefer that. (issue #155)
+ */
+function pickMediaSource(data: Record<string, unknown>): string {
+  const file = String(data.file ?? '').trim();
+  const url = String(data.url ?? '').trim();
+  const fallback = file || url || String(data.path ?? '').trim() || String(data.media ?? '').trim();
+  if (!file) return fallback;
+  // `file` is itself loadable: inline bytes, a remote url, or a path (anything
+  // carrying a `/` or `\` separator, incl. file:// and absolute/relative paths).
+  if (/^(base64:\/\/|data:|https?:\/\/|file:\/\/)/i.test(file) || /[\\/]/.test(file)) return file;
+  // `file` is a bare token (QQ-internal id) — fall back to a real url if present.
+  if (/^https?:\/\//i.test(url)) return url;
+  return fallback;
 }
 
 // --- JSON segment parsing ---
@@ -135,7 +162,7 @@ export async function segmentToElement(type: string, data: Record<string, unknow
       if (imgEmojiId) return marketFaceElement(imgEmojiId, data);
       return {
         type: 'image',
-        url: String(data.file ?? data.url ?? data.path ?? data.media ?? ''),
+        url: pickMediaSource(data),
         flash: data.type === 'flash',
         subType: intOr(data.subType, 0),
         summary: data.summary ? String(data.summary) : undefined,
@@ -152,7 +179,7 @@ export async function segmentToElement(type: string, data: Record<string, unknow
       return marketFaceElement(emojiId, data);
     }
     case 'record': {
-      const source = String(data.file ?? data.url ?? data.path ?? data.media ?? '');
+      const source = pickMediaSource(data);
       if (!source) return null;
       return {
         type: 'record',
@@ -160,7 +187,7 @@ export async function segmentToElement(type: string, data: Record<string, unknow
       };
     }
     case 'video': {
-      const source = String(data.file ?? data.url ?? data.path ?? data.media ?? '');
+      const source = pickMediaSource(data);
       if (!source) return null;
       return {
         type: 'video',
@@ -291,6 +318,13 @@ export async function segmentToElement(type: string, data: Record<string, unknow
       // Contact card — map to json card
       const contactType = String(data.type ?? 'qq');
       const contactId = String(data.id ?? '');
+      const numericId = intOr(contactId, 0);
+      const normalizedContactType = contactType.trim().toLowerCase();
+      if (numericId > 0 && options?.resolveContactArk && (normalizedContactType === 'qq' || normalizedContactType === 'group')) {
+        const ark = await options.resolveContactArk(contactType, numericId);
+        if (!ark) throw new Error(`contact ark unavailable for ${contactType}:${numericId}`);
+        return { type: 'json', text: ark };
+      }
       const jsonData = JSON.stringify({
         app: 'com.tencent.contact.lua',
         view: 'contact',

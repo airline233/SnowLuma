@@ -1,7 +1,8 @@
-// "通用设置" tab — fields that apply to the whole OneBotInstance rather
-// than any specific adapter: the music-sign service URL and the built-in
-// `#sl` status command. Edits here mark the config dirty and are
-// auto-saved with debounce by the parent ConfigPage.
+// "通用设置" tab — per-account fields that apply to the whole OneBotInstance
+// rather than any specific adapter: the built-in `#sl` status command and the
+// notification opt-in. Edits here mark the config dirty and are auto-saved with
+// debounce by the parent ConfigPage. (Deployment-wide knobs like the music-sign
+// URL live in Settings → 全局配置, not here.)
 
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
@@ -21,19 +22,6 @@ export function GeneralSettingsTab({ config, onChange }: GeneralSettingsTabProps
 
   return (
     <div className="flex flex-col gap-4">
-      <div className="flex flex-col gap-1.5 rounded-lg border bg-card/40 p-4">
-        <Label>音乐签名服务 URL</Label>
-        <Input
-          type="url"
-          placeholder="留空则不启用"
-          value={config.musicSignUrl ?? ''}
-          onChange={(e) => onChange({ ...config, musicSignUrl: e.target.value || undefined })}
-        />
-        <p className="text-[11px] leading-relaxed text-muted-foreground">
-          用于音乐分享卡片签名。未配置时音乐相关消息段会回落为普通文本。
-        </p>
-      </div>
-
       <div className="flex flex-col gap-4 rounded-lg border bg-card/40 p-4">
         <div className="flex items-start justify-between gap-3">
           <div className="min-w-0">
@@ -49,6 +37,20 @@ export function GeneralSettingsTab({ config, onChange }: GeneralSettingsTabProps
             onChange={(v) => setStatusCommand({ enabled: v })}
             ariaLabel="启用 #sl 状态命令"
           />
+        </div>
+
+        <div className="flex flex-col gap-1.5 border-t pt-3">
+          <Label className={sc.enabled ? undefined : 'text-muted-foreground'}>触发词</Label>
+          <Input
+            className="w-full font-mono"
+            value={sc.trigger}
+            disabled={!sc.enabled}
+            maxLength={32}
+            onChange={(e) => setStatusCommand({ trigger: e.target.value })}
+          />
+          <p className="text-[11px] leading-relaxed text-muted-foreground">
+            自定义触发词，默认 <code className="font-mono">#sl</code>。最长 32 字符，匹配前会去除首尾空格并转为小写。
+          </p>
         </div>
 
         <div className="flex items-start justify-between gap-3 border-t pt-3">

@@ -4,7 +4,10 @@ import type {
   BackupImportResult,
   DebugActionDoc,
   DebugInvokeResult,
+  DebugStreamFrame,
   DebugStreamMessage,
+  DebugUploadResult,
+  GlobalSettings,
   HookProcessInfo,
   LogEntry,
   LogLevel,
@@ -73,6 +76,20 @@ export interface LogsStreamOptions {
   onStatus?: (status: StreamStatus) => void;
 }
 
+/** A single frame from /api/state/stream — either a control frame or a
+ *  fresh snapshot for one of the three live dashboard resources. */
+export type StateStreamEvent =
+  | { kind: 'ready' }
+  | { kind: 'dropped'; count: number }
+  | { resource: 'processes'; data: HookProcessInfo[] }
+  | { resource: 'qq-list'; data: QQInfo[] }
+  | { resource: 'connections'; data: AccountConnections[] };
+
+export interface StateStreamOptions {
+  onEvent: (event: StateStreamEvent) => void;
+  onStatus?: (status: StreamStatus) => void;
+}
+
 export interface ApiClient {
   // ---- auth ----
   login(password: string): Promise<LoginResult>;
@@ -97,6 +114,13 @@ export interface ApiClient {
   system(): Promise<SystemInfo>;
   /** Live OneBot adapter health per account. */
   connections(): Promise<AccountConnections[]>;
+
+  /** Subscribe to the unified SSE feed pushing fresh snapshots whenever
+   *  processes / qq-list / connections change. Initial frames on connect
+   *  give the current snapshot for all three resources. Returns a disposer.
+   *  REST endpoints above remain for the pre-SSE first paint and the slow
+   *  reconcile fallback if the SSE drops. */
+  stateStream(options: StateStreamOptions): () => void;
 
   // ---- hook processes ----
   processes: {
@@ -130,6 +154,21 @@ export interface ApiClient {
   debug: {
     actions(): Promise<{ actions: DebugActionDoc[]; categories: { category: string; count: number }[] }>;
     invoke(uin: string, action: string, params: Record<string, unknown>): Promise<DebugInvokeResult>;
+    /** Invoke a Stream API action (or any action) and receive every frame.
+     *  Resolves when the stream ends; pass a signal to cancel. */
+    invokeStream(
+      uin: string,
+      action: string,
+      params: Record<string, unknown>,
+      onFrame: (frame: DebugStreamFrame) => void,
+      signal?: AbortSignal,
+    ): Promise<void>;
+    /** Stream a browser file to a temp path on the server; returns the path to
+     *  feed a send action. `onProgress` reports 0..1 of bytes uploaded. */
+    upload(
+      file: File,
+      opts?: { filename?: string; onProgress?: (fraction: number) => void; signal?: AbortSignal },
+    ): Promise<DebugUploadResult>;
     /** Live merged SSE; returns an unsubscribe. */
     stream(onMessage: (m: DebugStreamMessage) => void, onStatus?: (s: StreamStatus) => void): () => void;
   };
@@ -144,6 +183,14 @@ export interface ApiClient {
     recent(limit?: number): Promise<NotificationDeliveryRecord[]>;
     /** Fire a one-off test to a single channel by id. */
     test(channelId: string): Promise<{ success: boolean; message?: string; status?: number }>;
+  };
+
+  // ---- global deployment config (rkey fallback servers + musicSignUrl) ----
+  globalConfig: {
+    /** Fetch the all-accounts global settings (config/snowluma.json). Bearer-gated. */
+    get(): Promise<GlobalSettings>;
+    /** Persist global settings (section-merged + normalized server-side). */
+    save(config: Partial<GlobalSettings>): Promise<GlobalSettings>;
   };
 
   // ---- update check ----
