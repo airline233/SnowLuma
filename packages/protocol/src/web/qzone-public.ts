@@ -441,6 +441,82 @@ export function getQzonePublicFeedDetail(
     });
 }
 
+// ─────── 按 tid 读说说详情 (GetFeedDetail, feed_action_domain_type=1) ───────
+// The old 说说 read path used emotion_cgi_msgdetail_v6; this one is the
+// same trpc reader as the public-feed surface but addressed by the legacy
+// 24-hex tid instead of a live feed object. The server wants a `ugc_id`
+// blob alongside the tid: a hand-rolled protobuf (see the field layout in
+// encodeQzoneUgcId) whose author/sequence fields are the little-endian
+// halves of the tid — confirmed against live responses where field 3 equals
+// cell_common.time and field 2 equals the author uin.
+
+const TID_PATTERN = /^[0-9a-f]{24}$/i;
+
+function encodeVarint(value: number): number[] {
+    const bytes: number[] = [];
+    let rest = value;
+
+    while (rest >= 0x80) {
+        bytes.push((rest % 0x80) | 0x80);
+        rest = Math.floor(rest / 0x80);
+    }
+
+    bytes.push(rest);
+    return bytes;
+}
+
+function pushVarintField(bytes: number[], field: number, value: number): void {
+    bytes.push(...encodeVarint(field * 8), ...encodeVarint(value));
+}
+
+function pushStringField(bytes: number[], field: number, value: string): void {
+    const encoded = Buffer.from(value, 'utf8');
+    bytes.push(...encodeVarint(field * 8 + 2), ...encodeVarint(encoded.length), ...encoded);
+}
+
+/** Author QQ number encoded in the first four bytes of a 说说 tid. */
+export function qzoneTidAuthorUin(tid: string): number {
+    if (!TID_PATTERN.test(tid)) {
+        throw new Error('说说 tid 必须是 24 位十六进制');
+    }
+
+    return Buffer.from(tid.slice(0, 8), 'hex').readUInt32LE(0);
+}
+
+/**
+ * Build the `ugc_id` the trpc reader expects for a legacy tid. Field layout,
+ * in the order the server emits it: 1 appid (always 311), 2 author uin,
+ * 3 post timestamp, 4/5 empty strings, 6 flag "0", 8 the tid itself.
+ */
+export function encodeQzoneUgcId(tid: string): string {
+    const authorUin = qzoneTidAuthorUin(tid);
+    const sequence = Buffer.from(tid.slice(8, 16), 'hex').readUInt32LE(0);
+    const bytes: number[] = [];
+
+    pushVarintField(bytes, 1, 311);
+    pushVarintField(bytes, 2, authorUin);
+    pushVarintField(bytes, 3, sequence);
+    pushStringField(bytes, 4, '');
+    pushStringField(bytes, 5, '');
+    pushStringField(bytes, 6, '0');
+    pushStringField(bytes, 8, tid);
+
+    return Buffer.from(bytes).toString('base64');
+}
+
+export function getQzoneFeedDetailByTid(
+    cookies: Record<string, string>,
+    tid: string,
+    attachInfo?: string,
+): Promise<JsonObject> {
+    return request(cookies, reader, 'GetFeedDetail', '0x97b1_1', {
+        union_id: { feed_id: tid, ugc_id: encodeQzoneUgcId(tid), adv_id: null },
+        feed_action_domain_type: 1,
+        from_page: 1,
+        ...(attachInfo === undefined ? {} : { attach_info: attachInfo }),
+    });
+}
+
 export function getQzonePublicComments(
     cookies: Record<string, string>,
     feed: JsonObject,

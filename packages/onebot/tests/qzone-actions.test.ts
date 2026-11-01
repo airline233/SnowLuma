@@ -169,7 +169,7 @@ describe('qzone actions', () => {
             tid: 'T1',
         });
         expect(res).toMatchObject({ status: 'ok', retcode: 0, data: detail });
-        expect(getMsgDetail).toHaveBeenCalledWith('T1', undefined, 0, 20);
+        expect(getMsgDetail).toHaveBeenCalledWith('T1', undefined, 0, 20, undefined);
         expect(
             actions.find((action) => action.names.includes('get_qzone_msg_detail'))?.describe()
                 .readOnly,
@@ -187,7 +187,57 @@ describe('qzone actions', () => {
             num: '10',
         });
         expect(res).toMatchObject({ status: 'ok', retcode: 0 });
-        expect(getMsgDetail).toHaveBeenCalledWith('T1', 20002, 5, 10);
+        expect(getMsgDetail).toHaveBeenCalledWith('T1', 20002, 5, 10, undefined);
+    });
+
+    it('get_qzone_msg_detail forwards attach_info without local pagination', async () => {
+        const getMsgDetail = vi
+            .fn()
+            .mockResolvedValue({ tid: 'T1', content: '', comment_num: 0, comments: [] });
+        const res = await makeHandler({ getMsgDetail }).handle('get_qzone_msg_detail', {
+            tid: 'T1',
+            attach_info: '{"page_num":2}',
+        });
+        expect(res).toMatchObject({ status: 'ok', retcode: 0 });
+        expect(getMsgDetail).toHaveBeenCalledWith('T1', undefined, 0, 20, '{"page_num":2}');
+    });
+
+    it('get_qzone_msg_detail serializes an attach_info object decoded from the query string', async () => {
+        const getMsgDetail = vi
+            .fn()
+            .mockResolvedValue({ tid: 'T1', content: '', comment_num: 0, comments: [] });
+        const attachInfo = { page_num: 2, ufo: 'CommentListOffset=11' };
+        const res = await makeHandler({ getMsgDetail }).handle('get_qzone_msg_detail', {
+            tid: 'T1',
+            attach_info: attachInfo,
+        });
+        expect(res).toMatchObject({ status: 'ok', retcode: 0 });
+        expect(getMsgDetail).toHaveBeenCalledWith(
+            'T1',
+            undefined,
+            0,
+            20,
+            JSON.stringify(attachInfo),
+        );
+    });
+
+    it('get_qzone_msg_detail describes both accepted cursor forms consistently', () => {
+        const doc = actions
+            .find((action) => action.names.includes('get_qzone_msg_detail'))!
+            .describe();
+        const cursorSchema = {
+            anyOf: [
+                expect.objectContaining({ type: 'string', minLength: 1 }),
+                { type: 'object', additionalProperties: true },
+            ],
+        };
+
+        expect(doc).toMatchObject({
+            params: expect.arrayContaining([
+                expect.objectContaining({ name: 'attach_info', schema: cursorSchema }),
+            ]),
+            inputSchema: { properties: { attach_info: cursorSchema } },
+        });
     });
 
     it.each([
@@ -198,6 +248,8 @@ describe('qzone actions', () => {
         { tid: 'T1', pos: -1 },
         { tid: 'T1', num: 0 },
         { tid: 'T1', num: 101 },
+        { tid: 'T1', attach_info: null },
+        { tid: 'T1', attach_info: [] },
     ])('get_qzone_msg_detail rejects invalid params (%j) before fetching', async (params) => {
         const getMsgDetail = vi.fn();
         const res = await makeHandler({ getMsgDetail }).handle('get_qzone_msg_detail', params);

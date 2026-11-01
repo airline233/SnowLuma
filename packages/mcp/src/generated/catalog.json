@@ -11538,9 +11538,10 @@
       "name": "get_qzone_msg_detail",
       "aliases": [],
       "summary": "获取 QQ 空间说说详情与一页评论（含服务端内联回复，需有访问权限）",
-      "returns": "说说详情、服务端报告的评论总数与本页评论；replies 仅含服务端内联返回的二级回复，不保证完整。",
+      "returns": "上游详情对象（含 feed、attach_info、has_more 等原样字段）以及 tid、content、comment_num、comments；pos/num 截取模式继续按偏移读取，不与上游游标混用。replies 仅含服务端内联回复，不保证完整。",
       "returnsSchema": {
         "type": "object",
+        "additionalProperties": true,
         "properties": {
           "tid": {
             "type": "string",
@@ -11553,6 +11554,22 @@
           "comment_num": {
             "type": "integer",
             "description": "服务端报告的评论总数（非本页数量）"
+          },
+          "feed": {
+            "type": "object",
+            "additionalProperties": true,
+            "description": "上游动态包装对象；其中的 feed 字段可传给公共评论、回复和点赞接口"
+          },
+          "attach_info": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "最后一次读取的完整上游页游标；不能用于续接按 pos/num 截取后的 comments，截取模式继续使用 pos/num"
+          },
+          "has_more": {
+            "type": "boolean",
+            "description": "上游是否还有更多评论分页"
           },
           "comments": {
             "type": "array",
@@ -11653,7 +11670,15 @@
             "pos": 0,
             "num": 20
           },
-          "notes": "tid 来自 get_qzone_msg_list；操作需有该说说的访问或管理权限。 replies 仅为服务端内联回复，不保证完整。"
+          "notes": "tid 来自 get_qzone_msg_list；操作需有该说说的访问权限。下一次 pos 增加本次 comments 的数量，返回不足 num 时已读完；不要用上游 attach_info 续接截取后的 comments。replies 仅为服务端内联回复。"
+        },
+        {
+          "summary": "按上次返回的 attach_info 直接读取指定评论分页",
+          "params": {
+            "tid": "<tid-from-get_qzone_msg_list>",
+            "attach_info": "<attach_info-from-previous-response>"
+          },
+          "notes": "attach_info 只用于完整上游页之间的续读，传入后 pos/num 不生效；首次完整上游页的评论位于 feed.feed.cell_comment.comments。互动动作使用返回的 feed.feed。"
         }
       ],
       "readOnly": true,
@@ -11677,7 +11702,7 @@
             "type": "integer",
             "minimum": 1
           },
-          "desc": "说说所属 QQ 号，省略则取机器人自己"
+          "desc": "说说所属 QQ 号，省略则从 tid 推断"
         },
         {
           "name": "pos",
@@ -11687,7 +11712,7 @@
             "type": "integer",
             "minimum": 0
           },
-          "desc": "一级评论起始偏移",
+          "desc": "一级评论起始偏移；传入 attach_info 时不生效",
           "default": 0
         },
         {
@@ -11699,8 +11724,26 @@
             "minimum": 1,
             "maximum": 100
           },
-          "desc": "请求的一级评论数量，实际数量受服务端限制",
+          "desc": "一级评论数量，服务端不足时内部翻页补齐；传入 attach_info 时不生效",
           "default": 20
+        },
+        {
+          "name": "attach_info",
+          "type": "string | object",
+          "required": false,
+          "schema": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1
+              },
+              {
+                "type": "object",
+                "additionalProperties": true
+              }
+            ]
+          },
+          "desc": "完整上游页返回的 attach_info 字符串或解析后的对象；pos/num 截取模式继续按偏移读取，不与游标混用"
         }
       ],
       "invariants": [],
@@ -11715,21 +11758,34 @@
           "target_uin": {
             "type": "integer",
             "minimum": 1,
-            "description": "说说所属 QQ 号，省略则取机器人自己",
+            "description": "说说所属 QQ 号，省略则从 tid 推断",
             "x-role": "user_id"
           },
           "pos": {
             "type": "integer",
             "minimum": 0,
-            "description": "一级评论起始偏移",
+            "description": "一级评论起始偏移；传入 attach_info 时不生效",
             "default": 0
           },
           "num": {
             "type": "integer",
             "minimum": 1,
             "maximum": 100,
-            "description": "请求的一级评论数量，实际数量受服务端限制",
+            "description": "一级评论数量，服务端不足时内部翻页补齐；传入 attach_info 时不生效",
             "default": 20
+          },
+          "attach_info": {
+            "anyOf": [
+              {
+                "type": "string",
+                "minLength": 1,
+                "description": "完整上游页返回的 attach_info 字符串或解析后的对象；pos/num 截取模式继续按偏移读取，不与游标混用"
+              },
+              {
+                "type": "object",
+                "additionalProperties": true
+              }
+            ]
           }
         },
         "required": [

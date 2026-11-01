@@ -166,7 +166,7 @@ await bot.raw('set_qzone_profile', { description: '' }); // 清空说明
 ```ts
 const detail = await bot.raw('get_qzone_msg_detail', {
   tid: '说说 ID', // 来自 get_qzone_msg_list / send_qzone_msg
-  // target_uin: 10001, // 省略时读取机器人自己的空间
+  // target_uin: 10001, // 省略时从 tid 解析作者；提供时必须与 tid 的作者一致
   pos: 0,
   num: 20,
 });
@@ -175,11 +175,22 @@ for (const comment of detail.comments) {
   console.log(comment.comment_id, comment.uin, comment.name, comment.time, comment.content);
   console.log(comment.replies); // 服务端内联返回的二级回复
 }
+
+if (detail.comments.length === 20) {
+  const next = await bot.raw('get_qzone_msg_detail', {
+    tid: detail.tid,
+    pos: detail.comments.length,
+    num: 20,
+  });
+  console.log(next.comments);
+}
 ```
 
-`comment_num` 是服务端报告的总数，`comments` 是本页一级评论；`num` 范围为 1–100，实际返回数量可能更少。二级回复不单独分页，`replies` 不保证完整。评论 ID 在所属说说内唯一，二级回复 ID 在父评论内唯一；时间均为 Unix 秒，正文保留空间表情和 @ 标记。该接口复用当前账号的空间登录态，登录或访问权限失败会抛出 `SnowLumaApiError`。
+`pos`、`num` 保持原调用形式；`num` 范围为 1–100，内部会读取上游评论页再按偏移截取。继续读取时，`pos` 增加本次 `comments.length`；返回不足 `num` 时已经读完。`comment_num` 是服务端报告的总数。二级回复为服务端内联结果，`replies` 不保证完整；评论 ID 在所属说说内唯一，二级回复 ID 在父评论内唯一，时间均为 Unix 秒。正文由上游富文本的字符串片段拼接，完整富文本保留在 `feed` 中。
 
-分页参数及 `commentlist` / `list_3` 字段参考 [Qzone-API](https://github.com/SmartHypercube/Qzone-API/blob/master/qzone.py)。实际分页和可见内容取决于 QQ 空间服务端。
+详情通过 TRPC `GetFeedDetail` 读取，`feed`、`attach_info`、`has_more` 及未知字段保留最后一次上游响应。`feed` 是包装对象，公共评论、回复和点赞动作需要内部的 `detail.feed.feed`；它们需要完整动态和原始评论对象，不能用映射后的 `comments` 替代。
+
+`attach_info` 接受上游游标字符串或解析后的对象，传入后直接读取完整上游页，忽略 `pos/num`。它与 `has_more` 描述上游整页，不描述截取后的 `comments`；**按 `pos/num` 读取时继续使用偏移，不与游标混用，也不要仅凭 `has_more=false` 判断截取结果已经读完**。首次需要完整上游页时可请求 `num: 1`，从 `feed.feed.cell_comment.comments` 取该页原始评论，再按上游 `has_more` 和 `attach_info` 续读。末页游标可以为 `null`。该接口复用当前账号的登录态，登录或访问权限失败会抛出 `SnowLumaApiError`。
 
 ### 空友爱看与公共空间
 

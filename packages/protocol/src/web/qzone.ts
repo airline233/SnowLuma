@@ -1,7 +1,8 @@
-import type { JsonValue } from '@snowluma/common/json';
+import type { JsonObject, JsonValue } from '@snowluma/common/json';
 import { createLogger } from '@snowluma/common/logger';
 import { RequestUtil, cookieToString, getBknFromCookie } from './request-util';
 import { parseQzoneFeedContent, type QzoneFeedContent } from './qzone-feed-content';
+import { getQzoneFeedDetailByTid, qzoneTidAuthorUin } from './qzone-public';
 import {
     decodeQzoneFeedCursor,
     encodeQzoneFeedCursor,
@@ -2099,67 +2100,227 @@ function detailList(value: unknown, field: string): unknown[] {
     return value;
 }
 
-function mapQzoneComment(value: Record<string, unknown>, field: string): QzoneCommentReply {
-    const id =
-        typeof value.tid === 'number'
-            ? String(detailInteger(value.tid, `${field}.tid`))
-            : detailString(value.tid, `${field}.tid`);
-
-    if (!id) {
-        throw new Error(`invalid qzone msg detail: ${field}.tid is empty`);
-    }
+function mapFeedComment(value: unknown, field: string): QzoneCommentReply {
+    const comment = detailObject(value, field);
+    const user = detailObject(comment.user, `${field}.user`);
+    const id = comment.id;
 
     return {
-        comment_id: id,
-        uin: detailInteger(value.uin, `${field}.uin`, 1),
-        name: detailString(value.name, `${field}.name`),
-        time: detailInteger(value.create_time, `${field}.create_time`),
-        content: detailString(value.content, `${field}.content`),
+        comment_id:
+            typeof id === 'number'
+                ? String(detailInteger(id, `${field}.id`))
+                : detailString(id, `${field}.id`),
+        uin: detailInteger(user.uin, `${field}.user.uin`, 1),
+        name: detailString(user.nick, `${field}.user.nick`),
+        time: detailInteger(comment.time, `${field}.time`),
+        content: joinRichContent(comment.content, `${field}.content`),
     };
 }
 
 /**
- * Read one post and a page of comments, with the inline replies Qzone supplies.
- * Wire fields and pos/num follow SmartHypercube/Qzone-API's Comment / Emotion.load:
- * https://github.com/SmartHypercube/Qzone-API/blob/master/qzone.py
- * Mapping is independent of the update payload; malformed data must not look
- * like a successful empty page. No raw response (private content) is logged.
+ * The trpc reader carries text as rich segments (`[{type:0, content}]`);
+ * mentions and other segment kinds may leave `content` null, so only the
+ * string payloads are joined and the rest are skipped.
+ */
+function joinRichContent(value: unknown, field: string): string {
+    return detailList(value, field)
+        .map((segment) => {
+            const content = detailObject(segment, field).content;
+
+            if (content === undefined || content === null) {
+                return '';
+            }
+
+            return detailString(content, `${field}[].content`);
+        })
+        .join('');
+}
+
+function mapFeedComments(value: unknown, field: string): QzoneComment[] {
+    return detailList(value, field).map((entry, index) => {
+        const commentField = `${field}[${index}]`;
+        const comment = detailObject(entry, commentField);
+        const mapped = mapFeedComment(comment, commentField);
+
+        return {
+            ...mapped,
+            replies: detailList(comment.replys, `${commentField}.replys`).map(
+                (reply, replyIndex) => {
+                    const replyField = `${commentField}.replys[${replyIndex}]`;
+                    return {
+                        ...mapFeedComment(detailObject(reply, replyField), replyField),
+                        parent_comment_id: mapped.comment_id,
+                        parent_comment_uin: mapped.uin,
+                    };
+                },
+            ),
+        };
+    });
+}
+
+/** The inner feed object of a GetFeedDetail page (`data.feed.feed`). */
+function detailFeedObject(data: Record<string, unknown>): Record<string, unknown> {
+    return detailObject(detailObject(data.feed, 'feed').feed, 'feed.feed');
+}
+
+async function fetchQzoneFeedDetailPage(
+    cookieObject: Record<string, string>,
+    tid: string,
+    attachInfo?: string,
+): Promise<JsonObject> {
+    const data = await getQzoneFeedDetailByTid(cookieObject, tid, attachInfo);
+    const common = detailObject(detailFeedObject(data).cell_common, 'feed.feed.cell_common');
+
+    if (common.feed_id !== tid) {
+        throw new Error('invalid qzone msg detail: feed_id does not match the requested post');
+    }
+
+    detailHasMore(data);
+    detailAttachInfo(data);
+
+    return data;
+}
+
+function detailComments(data: Record<string, unknown>): QzoneComment[] {
+    const comment = detailObject(detailFeedObject(data).cell_comment, 'feed.feed.cell_comment');
+    return mapFeedComments(comment.comments, 'comments');
+}
+
+function detailCommentNum(data: Record<string, unknown>): number {
+    const comment = detailObject(detailFeedObject(data).cell_comment, 'feed.feed.cell_comment');
+    return detailInteger(comment.num, 'comment num');
+}
+
+/** The post body lives in `cell_summary.summary[]` as rich segments. */
+function detailSummary(data: Record<string, unknown>): string {
+    const summary = detailFeedObject(data).cell_summary;
+
+    if (summary === undefined || summary === null) {
+        return '';
+    }
+
+    return joinRichContent(detailObject(summary, 'feed.feed.cell_summary').summary, 'summary');
+}
+
+function detailAttachInfo(data: Record<string, unknown>): string | undefined {
+    const attachInfo = data.attach_info;
+
+    if (attachInfo === undefined || attachInfo === null) {
+        return undefined;
+    }
+
+    return detailString(attachInfo, 'attach_info');
+}
+
+function detailHasMore(data: Record<string, unknown>): boolean {
+    const hasMore = data.has_more;
+
+    if (typeof hasMore !== 'boolean') {
+        throw new Error('invalid qzone msg detail: has_more must be a boolean');
+    }
+
+    return hasMore;
+}
+
+function buildQzoneMsgDetail(
+    data: JsonObject,
+    tid: string,
+    comments: QzoneComment[],
+): QzoneMsgDetailResult {
+    // `data` is passed through verbatim so callers keep access to fields this
+    // helper does not interpret (feed, extra_streams, comment_load_mode, …);
+    // the derived entries below are the stable OneBot-facing ones.
+    return {
+        ...data,
+        tid,
+        content: detailSummary(data),
+        comment_num: detailCommentNum(data),
+        comments,
+    };
+}
+
+/** Refuse to loop forever on a cursor the server never advances. */
+const MAX_QZONE_DETAIL_PAGES = 50;
+
+/**
+ * Read one 说说 and a page of comments from the trpc feed reader.
+ *
+ * The endpoint is addressed by tid alone; `targetUin`, when given, is only a
+ * cross-check against the author encoded in the tid. `pos`/`num` are served by
+ * walking comment pages internally unless the caller supplies `attachInfo`,
+ * in which case that page is returned as-is and `pos`/`num` are not applied.
+ * `data` from the last response is passed through unchanged. Its upstream
+ * cursor advances a complete page, so offset reads must continue with pos/num.
  */
 export async function getQzoneMsgDetail(
     cookieObject: Record<string, string>,
-    targetUin: string,
+    targetUin: string | undefined,
     tid: string,
     pos = 0,
     num = 20,
+    attachInfo?: string,
 ): Promise<QzoneMsgDetailResult> {
-    const data = await fetchQzoneMsgDetail(cookieObject, targetUin, tid, { pos, num });
-    const resultTid = detailString(data.tid, 'tid');
-
-    if (!resultTid || resultTid !== tid) {
-        throw new Error('invalid qzone msg detail: tid does not match the requested post');
+    if (!cookieObject || typeof cookieObject !== 'object') {
+        throw new Error('cookieObject is required');
     }
 
-    return {
-        tid: resultTid,
-        content: detailString(data.content, 'content'),
-        comment_num: detailInteger(data.cmtnum, 'cmtnum'),
-        comments: detailList(data.commentlist, 'commentlist').map((value, index) => {
-            const field = `commentlist[${index}]`;
-            const comment = detailObject(value, field);
-            const mappedComment = mapQzoneComment(comment, field);
-            return {
-                ...mappedComment,
-                replies: detailList(comment.list_3, `${field}.list_3`).map((reply, replyIndex) => {
-                    const replyField = `${field}.list_3[${replyIndex}]`;
-                    return {
-                        ...mapQzoneComment(detailObject(reply, replyField), replyField),
-                        parent_comment_id: mappedComment.comment_id,
-                        parent_comment_uin: mappedComment.uin,
-                    };
-                }),
-            };
-        }),
-    };
+    if (!tid) {
+        throw new Error('tid is required');
+    }
+
+    if (!Number.isSafeInteger(pos) || pos < 0) {
+        throw new Error('qzone msg detail pos must be a non-negative integer');
+    }
+
+    if (!Number.isSafeInteger(num) || num < 1) {
+        throw new Error('qzone msg detail num must be a positive integer');
+    }
+
+    const authorUin = qzoneTidAuthorUin(tid);
+
+    if (targetUin !== undefined && targetUin !== '' && String(authorUin) !== targetUin) {
+        throw new Error(
+            `qzone msg detail: tid belongs to ${authorUin}, not target_uin=${targetUin}`,
+        );
+    }
+
+    if (attachInfo !== undefined) {
+        const data = await fetchQzoneFeedDetailPage(cookieObject, tid, attachInfo);
+        return buildQzoneMsgDetail(data, tid, detailComments(data));
+    }
+
+    let data = await fetchQzoneFeedDetailPage(cookieObject, tid);
+    const collected = detailComments(data);
+
+    for (let page = 1; collected.length < pos + num && detailHasMore(data); page++) {
+        if (page >= MAX_QZONE_DETAIL_PAGES) {
+            throw new Error('qzone msg detail paging exceeded the page limit');
+        }
+
+        const previous = detailAttachInfo(data);
+
+        if (!previous) {
+            throw new Error('qzone msg detail pagination did not advance');
+        }
+
+        data = await fetchQzoneFeedDetailPage(cookieObject, tid, previous);
+        collected.push(...detailComments(data));
+
+        if (detailHasMore(data) && detailAttachInfo(data) === previous) {
+            throw new Error('qzone msg detail pagination did not advance');
+        }
+    }
+
+    if (collected.length < pos + num) {
+        log.debug(
+            'getQzoneMsgDetail: stopped at %d comments (requested %d, tid=%s)',
+            collected.length,
+            pos + num,
+            tid,
+        );
+    }
+
+    return buildQzoneMsgDetail(data, tid, collected.slice(pos, pos + num));
 }
 
 /**

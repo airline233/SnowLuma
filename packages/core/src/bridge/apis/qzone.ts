@@ -185,16 +185,20 @@ export class QzoneApi {
         return getQzoneMsgList(cookieObject, uin, pos, num);
     }
 
-    /** 获取说说详情和一页评论。省略 targetUin 时使用当前账号。 */
+    /**
+     * 获取说说详情和评论。省略 targetUin 时由 getQzoneMsgDetail 从 tid 中解析
+     * 传入 attachInfo 时直接读取该分页；否则按 pos/num 内部翻页截取。
+     */
     async getMsgDetail(
         tid: string,
         targetUin?: number,
         pos = 0,
         num = 20,
+        attachInfo?: string,
     ): Promise<QzoneMsgDetailResult> {
-        const uin = targetUin === undefined ? this.ctx.identity.uin : String(targetUin);
+        const uin = targetUin === undefined ? undefined : String(targetUin);
         const cookieObject = await this.ctx.apis.web.getCookies('qzone.qq.com');
-        return getQzoneMsgDetail(cookieObject, uin, tid, pos, num);
+        return getQzoneMsgDetail(cookieObject, uin, tid, pos, num, attachInfo);
     }
 
     /**

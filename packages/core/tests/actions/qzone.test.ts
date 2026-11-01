@@ -86,13 +86,32 @@ describe('apis/qzone', () => {
             expect(getCookies).toHaveBeenCalledWith('qzone.qq.com');
             expect(fetchDetail).toHaveBeenCalledWith(
                 { p_skey: 'PSK' },
-                String(targetUin ?? 10001),
+                targetUin?.toString(),
                 'T1',
                 0,
                 20,
+                undefined,
             );
         },
     );
+
+    it('getMsgDetail forwards an upstream comment cursor', async () => {
+        const { bridge } = bridgeWithWeb();
+        const detail = { tid: 'T1', content: 'Post', comment_num: 0, comments: [] };
+        const fetchDetail = vi.spyOn(qzoneWeb, 'getQzoneMsgDetail').mockResolvedValue(detail);
+
+        expect(
+            await new QzoneApi(bridge as never).getMsgDetail('T1', undefined, 5, 10, 'cursor'),
+        ).toEqual(detail);
+        expect(fetchDetail).toHaveBeenCalledWith(
+            { p_skey: 'PSK' },
+            undefined,
+            'T1',
+            5,
+            10,
+            'cursor',
+        );
+    });
 
     it('getMsgDetail passes pagination and propagates cookie and protocol failures', async () => {
         const { bridge, getCookies } = bridgeWithWeb();
@@ -101,7 +120,14 @@ describe('apis/qzone', () => {
             .spyOn(qzoneWeb, 'getQzoneMsgDetail')
             .mockRejectedValue(new Error('denied'));
         await expect(api.getMsgDetail('T1', 20002, 10, 5)).rejects.toThrow('denied');
-        expect(fetchDetail).toHaveBeenCalledWith({ p_skey: 'PSK' }, '20002', 'T1', 10, 5);
+        expect(fetchDetail).toHaveBeenCalledWith(
+            { p_skey: 'PSK' },
+            '20002',
+            'T1',
+            10,
+            5,
+            undefined,
+        );
         getCookies.mockRejectedValueOnce(new Error('cookie failure'));
         await expect(api.getMsgDetail('T1')).rejects.toThrow('cookie failure');
         expect(fetchDetail).toHaveBeenCalledTimes(1);

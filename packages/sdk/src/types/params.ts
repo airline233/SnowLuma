@@ -426,12 +426,14 @@ export interface SendPacketParams extends JsonObject {
 
 export interface GetQzoneMsgDetailParams extends JsonObject {
     tid: string;
-    /** Post owner; defaults to the current account. */
+    /** Post owner; defaults to the author encoded in the tid. */
     target_uin?: number | string;
-    /** Top-level comment offset (default 0). */
+    /** Top-level comment offset (default 0). Ignored when `attach_info` is given. */
     pos?: number | string;
-    /** Requested page size, 1–100 (default 20); Qzone may return fewer. */
+    /** Requested page size, 1–100 (default 20); the server may return fewer. Ignored when `attach_info` is given. */
     num?: number | string;
+    /** Upstream cursor for complete upstream pages; continue sliced comments with pos/num. */
+    attach_info?: string | JsonObject;
 }
 
 /** Numeric action fields also accept numeric strings; bounds are checked by the server. */

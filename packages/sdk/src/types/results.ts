@@ -1,6 +1,6 @@
 import type { JsonArray, JsonObject, JsonValue } from './json.js';
 
-export interface QzoneCommentReply {
+export interface QzoneCommentReply extends JsonObject {
     uin: number;
     name: string;
     /** Unix seconds. */
@@ -18,12 +18,19 @@ export interface QzoneComment extends QzoneCommentReply {
     replies: QzoneCommentReply[];
 }
 
-export interface QzoneMsgDetailResult {
+export interface QzoneMsgDetailResult extends JsonObject {
     tid: string;
     content: string;
     /** Server-reported total, not the number of comments on this page. */
     comment_num: number;
     comments: QzoneComment[];
+    /** Upstream envelope; pass `feed.feed` to the public comment, reply and like actions. */
+    feed?: JsonObject & { feed: JsonObject };
+    /** Upstream cursor, verbatim; advances a complete upstream page, not the sliced `comments`. */
+    attach_info?: string | null;
+    /** Whether the upstream has another comment page. */
+    has_more?: boolean;
+    [key: string]: JsonValue | undefined;
 }
 
 export interface SendMessageResult {

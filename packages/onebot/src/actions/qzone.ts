@@ -1,7 +1,40 @@
-import { defineAction, f } from '../action-kit';
+import { defineAction, f, type Field } from '../action-kit';
 import type { ApiActionContext } from '../api-handler';
 import type { JsonValue } from '../types';
 import { okResponse } from '../types';
+
+/**
+ * 接受上游游标的原样字符串，也接受已被解码的对象：bridge 会对查询参数里的
+ * JSON 做序列化，因此把解析后的游标原样传回时，到达这里可能已经是对象。
+ * 对象会在交给底层字符串字段前重新序列化。
+ */
+function stringOrObject<T>(inner: Field<T>): Field<T> {
+    return {
+        get doc() {
+            return {
+                ...inner.doc,
+                type: 'string | object',
+                schema: {
+                    anyOf: [inner.doc.schema ?? {}, { type: 'object', additionalProperties: true }],
+                },
+            };
+        },
+        coerce: (raw, field) => {
+            const normalized =
+                typeof raw === 'object' && raw !== null && !Array.isArray(raw)
+                    ? JSON.stringify(raw)
+                    : raw;
+            return inner.coerce(normalized, field);
+        },
+        optional: () => stringOrObject(inner.optional()),
+        default: (value) => stringOrObject(inner.default(value)),
+        describe: (text) => stringOrObject(inner.describe(text)),
+        role: (role) => stringOrObject(inner.role(role)),
+        toJsonSchema: () => ({
+            anyOf: [inner.toJsonSchema(), { type: 'object', additionalProperties: true }],
+        }),
+    };
+}
 
 async function uploadQzoneImages(
     ctx: ApiActionContext,
@@ -168,19 +201,39 @@ export const actions = [
                     pos: 0,
                     num: 20,
                 },
-                notes: 'tid 来自 get_qzone_msg_list；操作需有该说说的访问或管理权限。 replies 仅为服务端内联回复，不保证完整。',
+                notes: 'tid 来自 get_qzone_msg_list；操作需有该说说的访问权限。下一次 pos 增加本次 comments 的数量，返回不足 num 时已读完；不要用上游 attach_info 续接截取后的 comments。replies 仅为服务端内联回复。',
+            },
+            {
+                summary: '按上次返回的 attach_info 直接读取指定评论分页',
+                params: {
+                    tid: '<tid-from-get_qzone_msg_list>',
+                    attach_info: '<attach_info-from-previous-response>',
+                },
+                notes: 'attach_info 只用于完整上游页之间的续读，传入后 pos/num 不生效；首次完整上游页的评论位于 feed.feed.cell_comment.comments。互动动作使用返回的 feed.feed。',
             },
         ],
         readOnly: true,
         summary: '获取 QQ 空间说说详情与一页评论（含服务端内联回复，需有访问权限）',
         returns:
-            '说说详情、服务端报告的评论总数与本页评论；replies 仅含服务端内联返回的二级回复，不保证完整。',
+            '上游详情对象（含 feed、attach_info、has_more 等原样字段）以及 tid、content、comment_num、comments；pos/num 截取模式继续按偏移读取，不与上游游标混用。replies 仅含服务端内联回复，不保证完整。',
         returnsSchema: {
             type: 'object',
+            additionalProperties: true,
             properties: {
                 tid: { type: 'string', description: '说说 ID' },
                 content: { type: 'string', description: '说说正文' },
                 comment_num: { type: 'integer', description: '服务端报告的评论总数（非本页数量）' },
+                feed: {
+                    type: 'object',
+                    additionalProperties: true,
+                    description: '上游动态包装对象；其中的 feed 字段可传给公共评论、回复和点赞接口',
+                },
+                attach_info: {
+                    type: ['string', 'null'],
+                    description:
+                        '最后一次读取的完整上游页游标；不能用于续接按 pos/num 截取后的 comments，截取模式继续使用 pos/num',
+                },
+                has_more: { type: 'boolean', description: '上游是否还有更多评论分页' },
                 comments: {
                     type: 'array',
                     description: '本页一级评论，数量可能少于 num',
@@ -222,15 +275,31 @@ export const actions = [
             tid: f
                 .string({ allowEmpty: false })
                 .describe('说说 tid（来自 get_qzone_msg_list / send_qzone_msg）'),
-            target_uin: f.userId().describe('说说所属 QQ 号，省略则取机器人自己').optional(),
-            pos: f.int({ min: 0 }).describe('一级评论起始偏移').default(0),
+            target_uin: f.userId().describe('说说所属 QQ 号，省略则从 tid 推断').optional(),
+            pos: f
+                .int({ min: 0 })
+                .describe('一级评论起始偏移；传入 attach_info 时不生效')
+                .default(0),
             num: f
                 .int({ min: 1, max: 100 })
-                .describe('请求的一级评论数量，实际数量受服务端限制')
+                .describe('一级评论数量，服务端不足时内部翻页补齐；传入 attach_info 时不生效')
                 .default(20),
+            attach_info: stringOrObject(f.string({ allowEmpty: false }))
+                .describe(
+                    '完整上游页返回的 attach_info 字符串或解析后的对象；pos/num 截取模式继续按偏移读取，不与游标混用',
+                )
+                .optional(),
         },
         run: async (p, ctx) =>
-            okResponse(await ctx.bridge.apis.qzone.getMsgDetail(p.tid, p.target_uin, p.pos, p.num)),
+            okResponse(
+                await ctx.bridge.apis.qzone.getMsgDetail(
+                    p.tid,
+                    p.target_uin,
+                    p.pos,
+                    p.num,
+                    p.attach_info,
+                ),
+            ),
     }),
 
     // get_qzone_feeds — 获取好友动态（feed）。只读，始终以机器人自己身份拉取。
